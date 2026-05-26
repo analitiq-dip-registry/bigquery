@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schemas.analitiq.ai/connector/latest.json",
+  "kind": "api",
+  "display_name": "REPLACE",
+  "description": "REPLACE with a short description",
+  "version": "1.0.0",
+  "default_transport": "api",
+  "transports": {
+    "api": {
+      "transport_type": "http",
+      "base_url": "https://api.example.com/v1/",
+      "headers": {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": { "template": "Bearer ${secrets.api_key}" }
+      },
+      "timeout_seconds": 30,
+      "rate_limit": {
+        "max_requests": 60,
+        "time_window_seconds": 60
+      }
+    }
+  },
+  "auth": {
+    "type": "api_key"
+  },
+  "connection_contract": {
+    "inputs": {
+      "api_key": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "secrets",
+        "type": "string",
+        "required": true,
+        "secret": true,
+        "ui": {
+          "label": "API Key",
+          "widget": "password"
+        }
+      }
+    }
+  }
+}

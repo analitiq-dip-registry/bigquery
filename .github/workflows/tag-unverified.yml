@@ -1,0 +1,101 @@
+name: Initialize new repo
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  init-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable discussions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ADMIN_PAT }}
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.update({ owner, repo, has_discussions: true });
+            console.log('Discussions enabled');
+
+      - name: Require validate check on main
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ADMIN_PAT }}
+          script: |
+            const { owner, repo } = context.repo;
+
+            // Read existing protection so we merge rather than replace.
+            // NOTE: 'validate' matches the job id in validate-definitions.yml — keep in sync.
+            let existing = null;
+            try {
+              ({ data: existing } = await github.rest.repos.getBranchProtection({
+                owner, repo, branch: 'main',
+              }));
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            const existingChecks = existing?.required_status_checks?.checks ?? [];
+
+            if (existingChecks.some(c => c.context === 'validate')) {
+              console.log('Branch protection already enforces validate check — nothing to do.');
+              return;
+            }
+
+            // Merge the new check into whatever protection already exists, preserving all
+            // fields so that admin-configured rules are not silently overwritten.
+            try {
+              await github.rest.repos.updateBranchProtection({
+                owner,
+                repo,
+                branch: 'main',
+                required_status_checks: {
+                  strict: existing?.required_status_checks?.strict ?? false,
+                  checks: [...existingChecks, { context: 'validate' }],
+                },
+                enforce_admins: existing?.enforce_admins?.enabled ?? false,
+                required_pull_request_reviews: existing?.required_pull_request_reviews ?? null,
+                restrictions: existing?.restrictions
+                  ? {
+                      users: existing.restrictions.users.map(u => u.login),
+                      teams: existing.restrictions.teams.map(t => t.slug),
+                      apps:  existing.restrictions.apps.map(a => a.slug),
+                    }
+                  : null,
+                required_linear_history:        existing?.required_linear_history?.enabled ?? false,
+                allow_force_pushes:             existing?.allow_force_pushes?.enabled ?? false,
+                allow_deletions:                existing?.allow_deletions?.enabled ?? false,
+                required_conversation_resolution: existing?.required_conversation_resolution?.enabled ?? false,
+              });
+            } catch (e) {
+              core.setFailed(
+                `Failed to set branch protection on ${owner}/${repo}: HTTP ${e.status} — ${e.message}. ` +
+                `Ensure ADMIN_PAT has the 'repo' scope with branch-protection write permission.`
+              );
+              throw e;
+            }
+
+            // GitHub defers enforcement of unknown check contexts until the check has
+            // reported at least once on this repo. Log the current state and move on —
+            // protection is registered and will activate automatically after the first
+            // PR runs the validate workflow.
+            try {
+              const { data: protection } = await github.rest.repos.getBranchProtection({
+                owner, repo, branch: 'main',
+              });
+              const active = (protection?.required_status_checks?.checks ?? [])
+                .some(c => c.context === 'validate');
+              if (active) {
+                console.log('Branch protection set: validate check required on main');
+              } else {
+                console.log(
+                  "Branch protection written. The 'validate' check context has not run on " +
+                  "this repo yet and will be enforced automatically after the first PR."
+                );
+              }
+            } catch (e) {
+              console.log(
+                `Warning: branch protection was written but verification read failed (HTTP ${e.status}). ` +
+                `The protection rule is likely active — verify manually if needed.`
+              );
+            }

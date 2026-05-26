@@ -1,0 +1,128 @@
+name: Version Bump on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  bump-version:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.ADMIN_PAT }}
+
+      - name: Determine bump type from labels
+        id: bump
+        run: |
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"version:major"'; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"version:minor"'; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"version:patch"'; then
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump manifest version
+        if: steps.bump.outputs.type != 'none'
+        run: |
+          BUMP_TYPE="${{ steps.bump.outputs.type }}"
+          MANIFEST="definition/manifest.json"
+
+          CURRENT=$(jq -r '.version' "$MANIFEST")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "$BUMP_TYPE" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          jq --arg v "$NEW_VERSION" '.version = $v' "$MANIFEST" > tmp.json && mv tmp.json "$MANIFEST"
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
+
+      - name: Update CHANGELOG.md
+        if: steps.bump.outputs.type != 'none'
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          TODAY=$(date +%Y-%m-%d)
+          BUMP_TYPE="${{ steps.bump.outputs.type }}"
+
+          # Determine changelog section based on bump type
+          case "$BUMP_TYPE" in
+            major) SECTION="Changed" ;;
+            minor) SECTION="Added" ;;
+            patch) SECTION="Fixed" ;;
+          esac
+
+          # Build the new entry
+          ENTRY="## [$NEW_VERSION] - $TODAY\n\n### $SECTION\n- $PR_TITLE (#$PR_NUMBER)"
+
+          # Insert after the first line (# Changelog)
+          sed -i "0,/^# Changelog$/{ /^# Changelog$/a\\
+          \\
+          $ENTRY
+          }" CHANGELOG.md
+
+      - name: Commit and push
+        if: steps.bump.outputs.type != 'none'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add definition/manifest.json CHANGELOG.md
+          git commit -m "chore: bump version to $NEW_VERSION (#${{ github.event.pull_request.number }})"
+          git push
+
+      - name: Create GitHub Release
+        if: steps.bump.outputs.type != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          TAG="v$NEW_VERSION"
+          NOTES="- $PR_TITLE (#$PR_NUMBER)"
+          gh release create "$TAG" \
+            --target main \
+            --title "$TAG" \
+            --notes "$NOTES"
+          RELEASE_URL=$(gh release view "$TAG" --json url --jq .url)
+          PUBLISHED_AT=$(gh release view "$TAG" --json publishedAt --jq .publishedAt)
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$RELEASE_URL" >> "$GITHUB_ENV"
+          echo "RELEASE_PUBLISHED_AT=$PUBLISHED_AT" >> "$GITHUB_ENV"
+
+      - name: Notify Analitiq webhook
+        if: steps.bump.outputs.type != 'none'
+        env:
+          WEBHOOK_URL: ${{ vars.ANALITIQ_WEBHOOK_URL }}
+          WEBHOOK_API_KEY: ${{ secrets.ANALITIQ_WEBHOOK_API_KEY }}
+          REPO: ${{ github.repository }}
+          BUMP_TYPE: ${{ steps.bump.outputs.type }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO" \
+            --arg version "$NEW_VERSION" \
+            --arg tag "$RELEASE_TAG" \
+            --arg release_url "$RELEASE_URL" \
+            --arg published_at "$RELEASE_PUBLISHED_AT" \
+            --arg bump "$BUMP_TYPE" \
+            '{repo: $repo, version: $version, tag: $tag, release_url: $release_url, published_at: $published_at, bump: $bump}')
+
+          curl --fail-with-body --silent --show-error \
+            -X POST "$WEBHOOK_URL" \
+            -H "x-api-key: $WEBHOOK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"

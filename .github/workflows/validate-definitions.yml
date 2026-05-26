@@ -1,0 +1,84 @@
+name: Validate Definitions
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  # NOTE: the job id 'validate' is referenced by the branch protection rule written in
+  # tag-unverified.yml (context: 'validate'). Renaming this job breaks enforcement.
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install check-jsonschema
+        run: pip install 'check-jsonschema==0.29.4'
+
+      - name: Fetch schemas
+        run: |
+          set -euo pipefail
+          mkdir -p .schemas
+          curl -sSfL https://schemas.analitiq.ai/connector/latest.json      -o .schemas/connector.json
+          curl -sSfL https://schemas.analitiq.ai/api-endpoint/latest.json   -o .schemas/api-endpoint.json
+          curl -sSfL https://schemas.analitiq.ai/database-endpoint/latest.json -o .schemas/database-endpoint.json
+          for f in .schemas/*.json; do
+            ACTUAL_ID=$(jq -r '."$id"' "$f")
+            EXPECTED_ID="https://schemas.analitiq.ai/$(basename "$f" .json)/latest.json"
+            if [ "$ACTUAL_ID" != "$EXPECTED_ID" ]; then
+              echo "ERROR: $f returned schema with \$id=$ACTUAL_ID (expected $EXPECTED_ID)"
+              exit 1
+            fi
+          done
+
+      - name: Validate connector.json
+        run: |
+          set -euo pipefail
+          if [ ! -f definition/connector.json ]; then
+            echo "ERROR: definition/connector.json is missing."
+            exit 1
+          fi
+          check-jsonschema \
+            --schemafile .schemas/connector.json \
+            definition/connector.json
+
+      - name: Validate endpoints
+        run: |
+          set -euo pipefail
+
+          if [ ! -d definition/endpoints ]; then
+            echo "No definition/endpoints/ directory — skipping endpoint validation."
+            exit 0
+          fi
+
+          mapfile -d '' -t ENDPOINTS < <(find definition/endpoints -name "*.json" -type f -print0)
+
+          if [ "${#ENDPOINTS[@]}" -eq 0 ]; then
+            echo "No endpoint files found — skipping."
+            exit 0
+          fi
+
+          CONNECTOR_KIND=$(jq -r '.kind' definition/connector.json)
+          if [ -z "$CONNECTOR_KIND" ] || [ "$CONNECTOR_KIND" = "null" ]; then
+            echo "ERROR: .kind is missing or null in definition/connector.json"
+            exit 1
+          fi
+
+          case "$CONNECTOR_KIND" in
+            api)      TYPE_SCHEMA=".schemas/api-endpoint.json" ;;
+            database) TYPE_SCHEMA=".schemas/database-endpoint.json" ;;
+            *)
+              echo "Unknown connector kind: '$CONNECTOR_KIND'"
+              exit 1
+              ;;
+          esac
+
+          for f in "${ENDPOINTS[@]}"; do
+            echo "--- $f ---"
+            check-jsonschema --schemafile "$TYPE_SCHEMA" "$f"
+          done
