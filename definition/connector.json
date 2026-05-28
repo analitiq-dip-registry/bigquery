@@ -3,7 +3,7 @@
   "kind": "api",
   "display_name": "REPLACE",
   "description": "REPLACE with a short description",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "default_transport": "api",
   "transports": {
     "api": {
