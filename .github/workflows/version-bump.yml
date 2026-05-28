@@ -33,13 +33,20 @@ jobs:
             echo "type=none" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump manifest version
+      - name: Bump connector version
         if: steps.bump.outputs.type != 'none'
         run: |
           BUMP_TYPE="${{ steps.bump.outputs.type }}"
-          MANIFEST="definition/manifest.json"
+          CONNECTOR="definition/connector.json"
 
-          CURRENT=$(jq -r '.version' "$MANIFEST")
+          CURRENT=$(jq -er '.version' "$CONNECTOR") || {
+            echo "::error file=$CONNECTOR::missing or null '.version' in $CONNECTOR" >&2
+            exit 1
+          }
+          if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=$CONNECTOR::'.version' is '$CURRENT', expected X.Y.Z" >&2
+            exit 1
+          fi
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 
           case "$BUMP_TYPE" in
@@ -49,7 +56,7 @@ jobs:
           esac
 
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          jq --arg v "$NEW_VERSION" '.version = $v' "$MANIFEST" > tmp.json && mv tmp.json "$MANIFEST"
+          jq --arg v "$NEW_VERSION" '.version = $v' "$CONNECTOR" > tmp.json && mv tmp.json "$CONNECTOR"
           echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
 
       - name: Update CHANGELOG.md
@@ -81,7 +88,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add definition/manifest.json CHANGELOG.md
+          git add definition/connector.json CHANGELOG.md
           git commit -m "chore: bump version to $NEW_VERSION (#${{ github.event.pull_request.number }})"
           git push
 

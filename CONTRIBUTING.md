@@ -47,14 +47,14 @@ No coding required — the plugin handles authentication research, endpoint sche
   - `version:minor` — new endpoints added
   - `version:patch` — fixes to existing definitions or documentation
   - `version:major` — breaking changes to authentication or connector structure
-- **Do not manually edit** `definition/manifest.json` version or `CHANGELOG.md` version entries — a GitHub Action updates these automatically when the PR is merged
+- **Do not manually edit** `definition/connector.json` version or `CHANGELOG.md` version entries — a GitHub Action updates these automatically when the PR is merged
 - **One connector per repo** — do not add multiple connectors to a single repository
 
 ## What the automated pipeline does
 
 When a PR is merged into `main` with a version label, the `Version Bump on PR Merge` workflow runs and:
 
-1. Bumps the version in `definition/manifest.json` according to the label
+1. Bumps the version in `definition/connector.json` according to the label
 2. Appends a new entry to `CHANGELOG.md` with the PR title and date
 3. Commits and pushes the bump to `main`
 4. Creates a git tag `vX.Y.Z` and a matching GitHub Release targeting `main`
@@ -70,7 +70,7 @@ When a PR is merged into `main` with a version label, the `Version Bump on PR Me
 
 The intended path is: **apply a version label to the PR before merging**. That is the only "release button" — merging a labeled PR runs the full pipeline end-to-end.
 
-If you already merged a PR without a label and want a release, open a small follow-up PR (for example a docs tweak) with the desired `version:*` label and merge it. Do not create tags or GitHub Releases by hand — doing so bypasses the manifest bump, the CHANGELOG entry, and the webhook notification, and leaves the registry out of sync.
+If you already merged a PR without a label and want a release, open a small follow-up PR (for example a docs tweak) with the desired `version:*` label and merge it. Do not create tags or GitHub Releases by hand — doing so bypasses the connector version bump, the CHANGELOG entry, and the webhook notification, and leaves the registry out of sync.
 
 ## Repository structure
 
@@ -82,8 +82,7 @@ connector-{name}/
 ├── CHANGELOG.md            # Version history (auto-updated on merge)
 ├── CONTRIBUTING.md         # This file
 └── definition/             # Connector definition files
-    ├── connector.json      # Authentication and connector config
-    ├── manifest.json       # Endpoint manifest with version (auto-bumped on merge)
+    ├── connector.json      # Authentication and connector config with version (auto-bumped on merge)
     └── endpoints/          # Individual endpoint JSON definitions
         └── {name}.json
 ```
