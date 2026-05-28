@@ -1,43 +1,217 @@
 {
   "$schema": "https://schemas.analitiq.ai/connector/latest.json",
-  "kind": "api",
-  "display_name": "REPLACE",
-  "description": "REPLACE with a short description",
+  "kind": "database",
+  "connector_id": "bigquery",
+  "display_name": "Google BigQuery",
+  "description": "Google BigQuery serverless data warehouse, accessed over the ADBC BigQuery driver. Authenticates with a service-account JSON key (default) or an OAuth user-credential flow; all connection state is passed via adbc.bigquery.* driver options.",
+  "tags": [
+    "database",
+    "warehouse",
+    "bigquery",
+    "google",
+    "gcp",
+    "adbc"
+  ],
   "version": "0.0.0",
-  "default_transport": "api",
+  "default_transport": "database",
   "transports": {
-    "api": {
-      "transport_type": "http",
-      "base_url": "https://api.example.com/v1/",
-      "headers": {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": { "template": "Bearer ${secrets.api_key}" }
-      },
-      "timeout_seconds": 30,
-      "rate_limit": {
-        "max_requests": 60,
-        "time_window_seconds": 60
+    "database": {
+      "transport_type": "adbc",
+      "driver": "bigquery",
+      "db_kwargs": {
+        "adbc.bigquery.project_id": { "ref": "connection.parameters.project_id" },
+        "adbc.bigquery.billing_project_id": { "ref": "connection.parameters.billing_project_id" },
+        "adbc.bigquery.auth_type": { "ref": "connection.parameters.auth_type" },
+        "adbc.bigquery.auth_json_credential": { "ref": "secrets.auth_json_credential" },
+        "adbc.bigquery.client_id": { "ref": "connection.parameters.client_id" },
+        "adbc.bigquery.client_secret": { "ref": "secrets.client_secret" },
+        "adbc.bigquery.refresh_token": { "ref": "secrets.refresh_token" },
+        "adbc.bigquery.access_token": { "ref": "secrets.access_token" },
+        "adbc.bigquery.audience_uri": { "ref": "connection.parameters.audience_uri" },
+        "adbc.bigquery.scopes": { "ref": "connection.parameters.scopes" },
+        "adbc.bigquery.client.timeout": { "ref": "connection.parameters.client_timeout" },
+        "adbc.bigquery.get_query_results_options.timeout": { "ref": "connection.parameters.query_results_timeout" }
       }
     }
   },
   "auth": {
-    "type": "api_key"
+    "type": "db"
   },
   "connection_contract": {
     "inputs": {
-      "api_key": {
+      "project_id": {
         "source": "user",
         "phase": "pre_auth",
-        "storage": "secrets",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "Project ID",
+          "placeholder": "my-gcp-project",
+          "widget": "text"
+        }
+      },
+      "billing_project_id": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "Billing Project ID",
+          "placeholder": "my-billing-project",
+          "widget": "text"
+        }
+      },
+      "dataset_id": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "Default Dataset",
+          "placeholder": "my_dataset",
+          "widget": "text"
+        }
+      },
+      "auth_type": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
         "type": "string",
         "required": true,
+        "enum": [
+          "service",
+          "user",
+          "aad"
+        ],
+        "default": "service",
+        "ui": {
+          "label": "Authentication Method",
+          "widget": "select"
+        }
+      },
+      "auth_json_credential": {
+        "source": "user",
+        "phase": "auth",
+        "storage": "secrets",
+        "type": "string",
+        "required": false,
         "secret": true,
         "ui": {
-          "label": "API Key",
+          "label": "Service Account JSON Key",
+          "placeholder": "Paste the full contents of the service-account JSON key file",
+          "widget": "textarea"
+        }
+      },
+      "client_id": {
+        "source": "user",
+        "phase": "auth",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "OAuth Client ID",
+          "widget": "text"
+        }
+      },
+      "client_secret": {
+        "source": "user",
+        "phase": "auth",
+        "storage": "secrets",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "ui": {
+          "label": "OAuth Client Secret",
           "widget": "password"
         }
+      },
+      "refresh_token": {
+        "source": "user",
+        "phase": "auth",
+        "storage": "secrets",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "ui": {
+          "label": "OAuth Refresh Token",
+          "widget": "password"
+        }
+      },
+      "access_token": {
+        "source": "user",
+        "phase": "auth",
+        "storage": "secrets",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "ui": {
+          "label": "Access Token",
+          "widget": "password"
+        }
+      },
+      "audience_uri": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "Token Audience URI",
+          "widget": "text"
+        }
+      },
+      "scopes": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "string",
+        "required": false,
+        "ui": {
+          "label": "OAuth Scopes",
+          "placeholder": "Comma-separated OAuth scopes",
+          "widget": "text"
+        }
+      },
+      "client_timeout": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "number",
+        "required": false,
+        "ui": {
+          "label": "Client Timeout (seconds)",
+          "widget": "number"
+        }
+      },
+      "query_results_timeout": {
+        "source": "user",
+        "phase": "pre_auth",
+        "storage": "connection.parameters",
+        "type": "number",
+        "required": false,
+        "ui": {
+          "label": "Query Results Timeout (seconds)",
+          "widget": "number"
+        }
       }
+    }
+  },
+  "resource_discovery": {
+    "strategy": "information_schema",
+    "transport_ref": "database",
+    "implementation": {
+      "type": "builtin"
+    },
+    "produces": [
+      "connection.endpoints",
+      "connection.type_map"
+    ],
+    "triggers": {
+      "list_resources": "on_activation",
+      "describe_resource": "on_resource_selected"
     }
   }
 }
