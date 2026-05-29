@@ -1,10 +1,12 @@
-# REPLACE_CONNECTOR_NAME
+# Google BigQuery
 
-REPLACE with a short description of what this connector does and what system it integrates with.
+Read schemas, tables, and views from Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver.
 
 ## What is this?
 
-This is a **connector** — a configuration that defines how to authenticate with REPLACE_SYSTEM_NAME and what data endpoints are available for reading and writing. It does not move data by itself. Instead, it is used by the [Analitiq](https://analitiq-app.com) data integration platform or the open-source `analitiq-dip-registry` engine to set up data pipelines.
+This is a **connector** — a configuration that defines how to authenticate with Google BigQuery and what data is available for reading and writing. It does not move data by itself. Instead, it is used by the [Analitiq](https://analitiq-app.com) data integration platform or the open-source `analitiq-dip-registry` engine to set up data pipelines.
+
+This is a **database** connector: it connects over the engine's ADBC BigQuery driver (`transport_type: adbc`, `driver: bigquery`) and discovers tables and column types at runtime from BigQuery's `INFORMATION_SCHEMA` — so there are no per-endpoint definition files.
 
 ## How to use this connector
 
@@ -27,43 +29,52 @@ The `analitiq-plugin-dataflow` plugin will automatically fetch the required conn
 
 ## Prerequisites
 
-REPLACE with what the user needs before they can connect. Be specific:
+Before you can connect, you need:
 
-- e.g., "A registered OAuth2 application with client ID and client secret"
-- e.g., "An API key generated from your account settings"
-- e.g., "Admin access to your organisation's account"
+- A **Google Cloud project** with the BigQuery API enabled.
+- Credentials for one of the supported authentication methods:
+  - **Service account (recommended):** a service-account JSON key file with at least the `BigQuery Data Viewer` and `BigQuery Job User` roles (or broader) on the project you want to read.
+  - **OAuth user credentials:** an OAuth client ID, client secret, and a refresh token.
+- The **project ID** you want to query (optional — it can be inferred from the credentials).
 
 ## Authentication
 
-REPLACE with a plain-language explanation of how to authenticate. If the system supports multiple authentication methods, explain when to use each one.
+BigQuery does **not** use a username and password and does **not** support API keys. Pick an authentication method via the `auth_type` setting:
+
+- **`service` (default)** — paste the full contents of a service-account JSON key into the **Service Account JSON Key** field. This is the recommended path for automated pipelines.
+- **`user`** — supply an OAuth **client ID**, **client secret**, and **refresh token**.
+- **`aad`** — supply a Microsoft Entra ID **access token** (and optionally an audience URI).
+
+All traffic goes to `googleapis.com` over TLS, which is always on.
 
 ### How to get your credentials
 
-REPLACE with step-by-step instructions:
+For a service-account key (recommended):
 
-1. e.g., "Log in to your account at https://app.example.com"
-2. e.g., "Navigate to Settings > API Keys"
-3. e.g., "Click 'Generate New Key' and copy the key"
+1. Open the [Google Cloud Console](https://console.cloud.google.com) and select your project.
+2. Go to **IAM & Admin > Service Accounts** and create (or pick) a service account.
+3. Grant it the BigQuery roles it needs (e.g. **BigQuery Data Viewer** + **BigQuery Job User**).
+4. Open the service account, go to **Keys > Add Key > Create new key**, choose **JSON**, and download the file.
+5. Paste the **entire contents** of that JSON file into the connector's **Service Account JSON Key** field.
 
-## Available Endpoints
+## Available Data
 
-The table below lists all data endpoints defined by this connector. Each endpoint represents a resource you can read from or write to.
+This is a database connector — it does not ship a fixed list of endpoints. Instead it discovers what is available at connection time:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-|          |        |             |
+| Resource | How it's discovered | Description |
+|----------|---------------------|-------------|
+| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map.json`. |
 
 ## Limitations
 
-REPLACE with any important limitations users should know about:
-
-- **Rate limits** — e.g., "The API allows 60 requests per minute"
-- **Data freshness** — e.g., "Data may be delayed by up to 15 minutes"
-- **Sandbox vs Production** — e.g., "Sandbox and production use different API keys"
+- **No TCP port** — BigQuery is an HTTPS REST API; there is no host or port to configure.
+- **Quotas & limits** — BigQuery enforces per-project quotas (concurrent queries, query length, API request rates, response size). Concrete values vary by project and edition; see the [BigQuery quotas documentation](https://cloud.google.com/bigquery/quotas).
+- **Type mapping** — `BIGNUMERIC` maps to `Decimal256`; `GEOGRAPHY` and `INTERVAL` are surfaced as text (`Utf8`); `ARRAY`, `STRUCT`, and `RANGE` are surfaced as `Json`.
+- **Default dataset** — `dataset_id` scopes discovery but is not passed as an ADBC driver option.
 
 ## For AI agents
 
-This connector includes `CLAUDE.md` and `AGENTS.md` files — machine-readable references used by AI agents and agentic frameworks. They document authentication types, available endpoints, post-auth steps, and any caveats for programmatic use. Both files are kept identical — `CLAUDE.md` is for Claude Code, `AGENTS.md` is for other agent frameworks.
+This connector includes `CLAUDE.md` and `AGENTS.md` files — machine-readable references used by AI agents and agentic frameworks. They document authentication types, available data, post-auth steps, and any caveats for programmatic use. Both files are kept identical — `CLAUDE.md` is for Claude Code, `AGENTS.md` is for other agent frameworks.
 
 ## Create a connector to any system
 
@@ -87,7 +98,9 @@ All connectors in this registry are community-maintained and live at [github.com
 
 ## Links
 
-- [API Documentation](REPLACE with URL)
+- [BigQuery documentation](https://cloud.google.com/bigquery/docs)
+- [BigQuery data types](https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types)
+- [ADBC BigQuery driver](https://arrow.apache.org/adbc/current/driver/bigquery.html)
 - [Analitiq Cloud](https://analitiq-app.com)
 - [Analitiq Engine (open source)](https://github.com/analitiq-ai/analitiq-engine)
 - [Analitiq DIP Registry (open source)](https://github.com/analitiq-dip-registry)
