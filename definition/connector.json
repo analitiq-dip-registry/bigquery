@@ -12,25 +12,49 @@
     "gcp",
     "adbc"
   ],
-  "version": "0.0.0",
+  "version": "0.0.1",
   "default_transport": "database",
   "transports": {
     "database": {
       "transport_type": "adbc",
       "driver": "bigquery",
       "db_kwargs": {
-        "adbc.bigquery.project_id": { "ref": "connection.parameters.project_id" },
-        "adbc.bigquery.billing_project_id": { "ref": "connection.parameters.billing_project_id" },
-        "adbc.bigquery.auth_type": { "ref": "connection.parameters.auth_type" },
-        "adbc.bigquery.auth_json_credential": { "ref": "secrets.auth_json_credential" },
-        "adbc.bigquery.client_id": { "ref": "connection.parameters.client_id" },
-        "adbc.bigquery.client_secret": { "ref": "secrets.client_secret" },
-        "adbc.bigquery.refresh_token": { "ref": "secrets.refresh_token" },
-        "adbc.bigquery.access_token": { "ref": "secrets.access_token" },
-        "adbc.bigquery.audience_uri": { "ref": "connection.parameters.audience_uri" },
-        "adbc.bigquery.scopes": { "ref": "connection.parameters.scopes" },
-        "adbc.bigquery.client.timeout": { "ref": "connection.parameters.client_timeout" },
-        "adbc.bigquery.get_query_results_options.timeout": { "ref": "connection.parameters.query_results_timeout" }
+        "adbc.bigquery.project_id": {
+          "ref": "connection.parameters.project_id"
+        },
+        "adbc.bigquery.billing_project_id": {
+          "ref": "connection.parameters.billing_project_id"
+        },
+        "adbc.bigquery.auth_type": {
+          "ref": "connection.parameters.auth_type"
+        },
+        "adbc.bigquery.auth_json_credential": {
+          "ref": "secrets.auth_json_credential"
+        },
+        "adbc.bigquery.client_id": {
+          "ref": "connection.parameters.client_id"
+        },
+        "adbc.bigquery.client_secret": {
+          "ref": "secrets.client_secret"
+        },
+        "adbc.bigquery.refresh_token": {
+          "ref": "secrets.refresh_token"
+        },
+        "adbc.bigquery.access_token": {
+          "ref": "secrets.access_token"
+        },
+        "adbc.bigquery.audience_uri": {
+          "ref": "connection.parameters.audience_uri"
+        },
+        "adbc.bigquery.scopes": {
+          "ref": "connection.parameters.scopes"
+        },
+        "adbc.bigquery.client.timeout": {
+          "ref": "connection.parameters.client_timeout"
+        },
+        "adbc.bigquery.get_query_results_options.timeout": {
+          "ref": "connection.parameters.query_results_timeout"
+        }
       }
     }
   },
