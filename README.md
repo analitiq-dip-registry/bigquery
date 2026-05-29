@@ -1,5 +1,9 @@
 # Google BigQuery
 
+[![Status: unverified](https://img.shields.io/badge/status-unverified-orange)](https://github.com/analitiq-dip-registry)
+[![Latest release](https://img.shields.io/github/v/release/analitiq-dip-registry/bigquery)](https://github.com/analitiq-dip-registry/bigquery/releases)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 Read schemas, tables, and views from Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver.
 
 ## What is this?
