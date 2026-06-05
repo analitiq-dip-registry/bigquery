@@ -7,15 +7,63 @@ on:
 jobs:
   init-repo:
     runs-on: ubuntu-latest
+    # Never run on the template repo itself — only on repos generated from it.
+    # The template keeps its REPLACE_REPO_NAME placeholder so generated repos inherit it;
+    # running the README fixup here would clobber that placeholder.
+    #
+    # has_discussions is the init-completion marker: 'Enable discussions' runs LAST below,
+    # so under normal operation it only flips to true once every other init step has
+    # succeeded. After that, this job skips entirely on routine pushes to main (version
+    # bumps, README edits). While init is incomplete the job retries on each push to main —
+    # the badge, topic, and protection steps each check current state before writing, so
+    # re-runs are safe. The guard is evaluated from the push event payload, so the skip
+    # path costs no API calls and no PAT.
+    # Caveats: the marker is the repo's discussions setting, which admins can also toggle.
+    # Enabling discussions out of band before init finishes stops the retries (finish init
+    # manually if that happens); disabling discussions later makes the next push to main
+    # re-run init, which re-enables them.
+    if: ${{ github.event.repository.is_template == false && github.event.repository.has_discussions == false }}
+    # contents: write is for the README badge fixup step below, which commits with the
+    # default GITHUB_TOKEN (whose pushes do NOT retrigger workflows — avoids a loop).
+    permissions:
+      contents: write
     steps:
-      - name: Enable discussions
+      # Runs FIRST, before the 'Require validate check on main' step sets branch
+      # protection, so the direct push to main is not blocked by the 'validate' check.
+      - name: Fill release badge with repo name
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const path = 'README.md';
+            const { data: file } = await github.rest.repos.getContent({ owner, repo, path });
+            const current = Buffer.from(file.content, 'base64').toString('utf8');
+            if (!current.includes('REPLACE_REPO_NAME')) {
+              console.log('No REPLACE_REPO_NAME placeholder in README — nothing to do.');
+              return;
+            }
+            const updated = current.split('REPLACE_REPO_NAME').join(repo);
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path,
+              message: 'chore: fill release badge with repo name',
+              content: Buffer.from(updated, 'utf8').toString('base64'),
+              sha: file.sha,
+            });
+            console.log(`README release badge slug set to ${repo}.`);
+
+      - name: Add 'unverified' topic
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.ADMIN_PAT }}
           script: |
             const { owner, repo } = context.repo;
-            await github.rest.repos.update({ owner, repo, has_discussions: true });
-            console.log('Discussions enabled');
+            const { data } = await github.rest.repos.getAllTopics({ owner, repo });
+            const topics = data.names || [];
+            if (!topics.includes('unverified')) {
+              topics.push('unverified');
+              await github.rest.repos.replaceAllTopics({ owner, repo, names: topics });
+            }
+            console.log(`Topics set to: ${topics.join(', ')}`);
 
       - name: Require validate check on main
         uses: actions/github-script@v7
@@ -99,3 +147,14 @@ jobs:
                 `The protection rule is likely active — verify manually if needed.`
               );
             }
+
+      # Runs LAST on purpose — has_discussions is the init-completion marker; see the
+      # job-level guard comment above.
+      - name: Enable discussions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ADMIN_PAT }}
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.update({ owner, repo, has_discussions: true });
+            console.log('Discussions enabled — repo initialization complete');
