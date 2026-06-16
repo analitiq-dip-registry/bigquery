@@ -1,0 +1,16 @@
+name: Notify Issue Agent
+
+# Thin caller for the org-wide reusable dispatch workflow. The triggers must live here
+# (reusable workflows can't declare their own); all dispatch logic and the Analitiq-Bot
+# guard live in analitiq-dip-registry/.github. To change behavior, edit that file — not
+# this stub. See: https://github.com/analitiq-dip-registry/.github/blob/main/.github/workflows/issue-agent.yml
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    uses: analitiq-dip-registry/.github/.github/workflows/issue-agent.yml@main
+    secrets: inherit
