@@ -18,9 +18,10 @@ via ``sqlalchemy.dialects.registry.load("bigquery")``, so
 ``sqlalchemy-bigquery`` is a required runtime dependency (see
 ``requirements.txt``).
 
-The write direction is fully declarative: ``definition/type-map.json``
-owns every column-type render, so this dialect ships no Python
-type-rendering table and needs no ``render_column_type`` override.
+Column-type mapping for both discovery and write is fully declarative:
+``definition/type-map.json`` owns every column-type render, so this
+dialect ships no Python type-rendering table and needs no
+``render_column_type`` override.
 
 Registered under connector_id ``bigquery`` via the package entry points
 (``analitiq.source_connectors`` / ``analitiq.destination_connectors``).
@@ -41,6 +42,16 @@ class BigQueryDialect(SqlDialect):
     # dataset; it is not a user dataset and must be excluded from discovery.
     system_schemas = ("INFORMATION_SCHEMA",)
     supports_upsert_adbc = True
+
+    # ---- ADBC-only write path ------------------------------------------------
+    def adbc_stage_table_sql(
+        self, stage_qualified: str, target_qualified: str
+    ) -> str:
+        # BigQuery supports CREATE TABLE … LIKE (Standard SQL, available
+        # since 2022). This copies column definitions for the stage table
+        # used by the ADBC MERGE upsert; partition specs are intentionally
+        # excluded from the stage table.
+        return f"CREATE TABLE {stage_qualified} LIKE {target_qualified}"
 
 
 class BigQueryConnector(GenericSQLConnector):
