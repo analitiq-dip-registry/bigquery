@@ -54,13 +54,15 @@ cast Arrow batch as an in-memory Parquet buffer submitted as a BigQuery
   the nested ``List``/``Struct``/``Map`` forms) render ``STRING`` DDL: the
   CDK ships ``Json`` values as Parquet ``STRING``, and BigQuery batch load
   jobs cannot populate ``JSON`` columns from Parquet. Columns that
-  materialize as genuine Arrow struct/list/map values (an endpoint column
-  declared with a real ``properties``/``items`` sub-schema) are serialized
-  to JSON text before the Parquet write (``_jsonify_nested_columns``), so
-  every Json-family column lands as ``STRING`` regardless of how it
-  materialized. ``Duration`` and ``Interval`` canonicals are rejected at
-  CREATE TABLE time (``render_column_type``): BigQuery INTERVAL cannot be
-  populated by a Parquet load job at all.
+  materialize as genuine Arrow struct/list/map values (e.g. an endpoint
+  column declared with a real ``properties``/``items`` sub-schema) are
+  serialized to JSON text before the Parquet write
+  (``_jsonify_nested_columns``), so every Json-family column lands as
+  ``STRING`` regardless of how it materialized; leaves JSON text would
+  silently corrupt (nested duration/interval/union, non-scalar map
+  keys) fail loud at write time instead. ``Duration`` and ``Interval``
+  canonicals are rejected at CREATE TABLE time (``render_column_type``):
+  BigQuery INTERVAL cannot be populated by a Parquet load job at all.
 
 Everything else BigQuery-specific lives here:
 
@@ -295,25 +297,138 @@ def _epoch_key(address: TableAddress) -> tuple[str, str, str]:
     return (address.catalog or "", address.schema or "", address.table)
 
 
-#: Arrow type predicates for columns that must be serialized to JSON text
-#: before the Parquet write: a genuine struct/list/map column loads into
-#: neither a ``JSON`` nor a ``STRING`` BigQuery column via a Parquet load
-#: job, while the Json-family DDL this connector renders is ``STRING``.
-#: Deliberately narrower than ``pa.types.is_nested`` (unions are not a
-#: Json-family materialization and stay untouched for the load job to
-#: reject loudly).
-_NESTED_TYPE_CHECKS = (
-    pa.types.is_struct,
-    pa.types.is_map,
-    pa.types.is_list,
-    pa.types.is_large_list,
-    pa.types.is_fixed_size_list,
-)
+def _pa_type_check(name: str, dtype: pa.DataType) -> bool:
+    """Apply a ``pa.types`` predicate that may not exist on older wheels.
+
+    ``is_list_view`` / ``is_large_list_view`` / ``is_run_end_encoded``
+    arrived in newer pyarrow releases; the CDK owns the pyarrow pin, so
+    this connector degrades gracefully (the predicate reports False and
+    the type simply is not treated) instead of failing at import.
+    """
+    check = getattr(pa.types, name, None)
+    return check is not None and check(dtype)
+
+
+def _is_listish(dtype: pa.DataType) -> bool:
+    """True for every Arrow list flavor that materializes a Python list.
+
+    Includes the view variants: they serialize to Parquet as LIST groups
+    just like plain lists, so leaving them out would reproduce the exact
+    unloadable-column failure this serialization exists to prevent.
+    """
+    return (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or _pa_type_check("is_list_view", dtype)
+        or _pa_type_check("is_large_list_view", dtype)
+    )
 
 
 def _needs_json_serialization(dtype: pa.DataType) -> bool:
-    """True when a column of *dtype* must become JSON text to be loadable."""
-    return any(check(dtype) for check in _NESTED_TYPE_CHECKS)
+    """True when a column of *dtype* must become JSON text to be loadable.
+
+    A genuine struct/list/map column loads into neither a ``JSON`` nor a
+    ``STRING`` BigQuery column via a Parquet load job, while the
+    Json-family DDL this connector renders is ``STRING``. Deliberately
+    narrower than ``pa.types.is_nested``: a TOP-LEVEL union is not a
+    Json-family materialization and stays untouched - it fails loud
+    client-side at the Parquet write (``ArrowNotImplementedError``,
+    wrapped fatal by the load method's pre-upload guard), not at the
+    load job. A union nested INSIDE a selected column is rejected by
+    ``_validate_json_leaf_types`` instead.
+    """
+    return (
+        pa.types.is_struct(dtype)
+        or pa.types.is_map(dtype)
+        or _is_listish(dtype)
+    )
+
+
+#: Leaf families with a faithful JSON text form. Anything outside this
+#: set (and not rejected outright) degrades to ``str(value)`` - which
+#: ``_validate_json_leaf_types`` surfaces as a per-column WARNING so the
+#: degradation is never silent.
+_JSON_CLEAN_LEAF_CHECKS = (
+    pa.types.is_null,
+    pa.types.is_boolean,
+    pa.types.is_integer,
+    pa.types.is_floating,
+    pa.types.is_decimal,
+    pa.types.is_string,
+    pa.types.is_large_string,
+    pa.types.is_binary,
+    pa.types.is_large_binary,
+    pa.types.is_fixed_size_binary,
+    pa.types.is_date,
+    pa.types.is_time,
+    pa.types.is_timestamp,
+)
+
+
+def _validate_json_leaf_types(
+    dtype: pa.DataType, path: str, exotic: list[str]
+) -> None:
+    """Validate a Json-family column's type tree before serialization.
+
+    Raises ``ValueError`` (wrapped deterministic/fatal by the caller's
+    pre-upload guard) for leaves JSON text would silently corrupt,
+    mirroring ``render_column_type``'s loud-rejection policy for the
+    same families at top level:
+
+    * duration / interval - ``str(timedelta)`` is not ISO-8601 (negative
+      values render the misleading ``-1 day, 23:59:59``) and
+      MonthDayNano renders as a Python repr; a FLAT column of these
+      types already fails loud at CREATE TABLE time, so a nested one
+      must not silently degrade;
+    * unions and any other unrecognized nested form - the value walk
+      would ``str()`` container values into Python-repr pseudo-JSON,
+      row-dependently;
+    * nested map KEY types - a JSON object key must be scalar text.
+
+    Leaves outside ``_JSON_CLEAN_LEAF_CHECKS`` that are not corrupting
+    (extension-ish scalars) are collected into *exotic* so the caller
+    can WARN once per column about the ``str(value)`` degradation.
+    """
+    if pa.types.is_dictionary(dtype) or _pa_type_check(
+        "is_run_end_encoded", dtype
+    ):
+        # to_pylist yields decoded logical values; validate those.
+        _validate_json_leaf_types(dtype.value_type, path, exotic)
+        return
+    if pa.types.is_struct(dtype):
+        for field in dtype:
+            _validate_json_leaf_types(
+                field.type, f"{path}.{field.name}", exotic
+            )
+        return
+    if pa.types.is_map(dtype):
+        if pa.types.is_nested(dtype.key_type):
+            raise ValueError(
+                f"column path {path!r} maps from Arrow key type "
+                f"{dtype.key_type}, which cannot become a scalar JSON "
+                "object key; cast the source column upstream"
+            )
+        _validate_json_leaf_types(dtype.key_type, f"{path}<key>", exotic)
+        _validate_json_leaf_types(dtype.item_type, f"{path}<item>", exotic)
+        return
+    if _is_listish(dtype):
+        _validate_json_leaf_types(dtype.value_type, f"{path}[]", exotic)
+        return
+    if (
+        pa.types.is_duration(dtype)
+        or pa.types.is_interval(dtype)
+        or pa.types.is_union(dtype)
+        or pa.types.is_nested(dtype)
+    ):
+        raise ValueError(
+            f"column path {path!r} has Arrow type {dtype}, which has no "
+            "faithful JSON text form on the Parquet load-job write path; "
+            "cast the source column upstream (e.g. duration -> Int64 raw "
+            "count or Utf8 ISO-8601 text)"
+        )
+    if not any(check(dtype) for check in _JSON_CLEAN_LEAF_CHECKS):
+        exotic.append(f"{path}: {dtype}")
 
 
 def _json_safe_scalar(value: Any) -> Any:
@@ -324,8 +439,10 @@ def _json_safe_scalar(value: Any) -> Any:
     their offset), Decimals become strings (float would silently lose
     precision), binary becomes base64 text, and non-finite floats become
     null (strict JSON has no NaN/Infinity, and BigQuery's ``PARSE_JSON``
-    rejects them). The ``str`` fallback keeps the conversion total - an
-    exotic leaf degrades to its text form instead of failing the batch.
+    rejects them). The ``str`` fallback keeps the conversion total for
+    the exotic scalar leaves ``_validate_json_leaf_types`` tolerates -
+    corrupting families never reach here (rejected at type level), and
+    the degradation is WARNING-logged per column, never silent.
     """
     if value is None or isinstance(value, (bool, int, str)):
         return value
@@ -340,38 +457,62 @@ def _json_safe_scalar(value: Any) -> Any:
     return str(value)
 
 
+def _json_safe_map_key(key: Any, key_type: pa.DataType) -> str:
+    """JSON object key for one Arrow map key: scalar text, loud on loss.
+
+    Keys deliberately do NOT ride the value path: the value rules turn
+    non-finite floats into null, which for a KEY would collapse every
+    NaN/Infinity key into the literal text ``'None'``, silently merging
+    distinct entries. A key that cannot keep its identity as text fails
+    the batch (deterministic - wrapped fatal by the pre-upload guard).
+    """
+    if key is None or (isinstance(key, float) and not math.isfinite(key)):
+        raise ValueError(
+            f"Arrow map key {key!r} cannot become a JSON object key; "
+            "cast the source column upstream"
+        )
+    safe = _json_safe_value(key, key_type)
+    return safe if isinstance(safe, str) else str(safe)
+
+
 def _json_safe_value(value: Any, dtype: pa.DataType) -> Any:
     """Recursively convert a ``to_pylist`` value to a JSON-dumpable one.
 
     Walks the Arrow type alongside the Python value so map entries are
     recognized structurally: ``to_pylist`` yields a map as a list of
-    ``(key, item)`` tuples, which must become a JSON object (keys coerced
-    to text - JSON object keys are always strings), never a list of
-    two-element arrays. Struct fields are read via ``dict.get`` so an
-    absent key degrades to null instead of raising.
+    ``(key, item)`` tuples, which must become a JSON object (keys via
+    ``_json_safe_map_key`` - JSON object keys are always strings, and
+    key collisions after text coercion fail loud instead of silently
+    last-wins merging), never a list of two-element arrays. Struct
+    fields are read by subscript: ``to_pylist`` always yields every
+    field, so a missing key is a violated invariant that must raise
+    (``KeyError`` is in the pre-upload guard's catch), not degrade to
+    null.
     """
     if value is None:
         return None
-    if pa.types.is_dictionary(dtype):
+    if pa.types.is_dictionary(dtype) or _pa_type_check(
+        "is_run_end_encoded", dtype
+    ):
         return _json_safe_value(value, dtype.value_type)
     if pa.types.is_struct(dtype):
         return {
-            field.name: _json_safe_value(value.get(field.name), field.type)
+            field.name: _json_safe_value(value[field.name], field.type)
             for field in dtype
         }
     if pa.types.is_map(dtype):
         entries = {}
         for key, item in value:
-            safe_key = _json_safe_scalar(key)
-            if not isinstance(safe_key, str):
-                safe_key = str(safe_key)
+            safe_key = _json_safe_map_key(key, dtype.key_type)
+            if safe_key in entries:
+                raise ValueError(
+                    f"map keys collide as JSON object keys: {safe_key!r} "
+                    "(duplicate source keys, or distinct keys whose text "
+                    "forms coincide); JSON objects cannot hold both"
+                )
             entries[safe_key] = _json_safe_value(item, dtype.item_type)
         return entries
-    if (
-        pa.types.is_list(dtype)
-        or pa.types.is_large_list(dtype)
-        or pa.types.is_fixed_size_list(dtype)
-    ):
+    if _is_listish(dtype):
         return [_json_safe_value(item, dtype.value_type) for item in value]
     return _json_safe_scalar(value)
 
@@ -391,7 +532,14 @@ def _jsonify_nested_columns(batch: pa.RecordBatch) -> pa.RecordBatch:
     Json-family column land as ``STRING`` regardless of how it
     materialized. Null slots stay NULL (not the text ``"null"``); the
     original field nullability and any schema/field metadata are
-    preserved.
+    preserved. Each column's type tree is validated first
+    (``_validate_json_leaf_types``): leaves JSON text would silently
+    corrupt (duration/interval/union, non-scalar map keys) fail loud
+    and deterministic, and tolerated exotic leaves are WARNING-logged
+    once per column before they degrade to their text form. The text
+    lands as ``large_string`` - the same Arrow type opaque ``Json``
+    values ship as, and uncapped where ``string`` tops out at 2GB per
+    column per batch.
     """
     nested_indices = [
         index
@@ -404,6 +552,16 @@ def _jsonify_nested_columns(batch: pa.RecordBatch) -> pa.RecordBatch:
     fields = [batch.schema.field(index) for index in range(batch.num_columns)]
     for index in nested_indices:
         field = fields[index]
+        exotic: list[str] = []
+        _validate_json_leaf_types(field.type, field.name, exotic)
+        if exotic:
+            logger.warning(
+                "BigQuery JSON serialization of column %r: leaf types "
+                "with no canonical JSON form degrade to their Python "
+                "text form: %s",
+                field.name,
+                "; ".join(exotic),
+            )
         texts = [
             None
             if value is None
@@ -414,9 +572,12 @@ def _jsonify_nested_columns(batch: pa.RecordBatch) -> pa.RecordBatch:
             )
             for value in columns[index].to_pylist()
         ]
-        columns[index] = pa.array(texts, type=pa.string())
+        columns[index] = pa.array(texts, type=pa.large_string())
         fields[index] = pa.field(
-            field.name, pa.string(), nullable=field.nullable, metadata=field.metadata
+            field.name,
+            pa.large_string(),
+            nullable=field.nullable,
+            metadata=field.metadata,
         )
     return pa.RecordBatch.from_arrays(
         columns, schema=pa.schema(fields, metadata=batch.schema.metadata)
@@ -1028,15 +1189,29 @@ class BigQueryConnector(GenericSQLConnector):
                 loadable_batch = _jsonify_nested_columns(cast_batch)
                 buffer = io.BytesIO()
                 pq.write_table(pa.Table.from_batches([loadable_batch]), buffer)
-            except (pa.ArrowException, ValueError, TypeError) as exc:
+            except (
+                pa.ArrowException,
+                ValueError,
+                TypeError,
+                KeyError,
+                RecursionError,
+            ) as exc:
                 if isinstance(exc, pa.ArrowMemoryError):
                     # Transient memory pressure, not a deterministic
-                    # input defect - leave it retryable.
+                    # input defect - leave it retryable. (A plain
+                    # MemoryError from to_pylist materializing a huge
+                    # nested column escapes this wrap entirely and also
+                    # acks RETRYABLE - same transient-pressure policy.)
                     raise
                 # Deterministic client-side failure: a malformed
                 # project/dataset/table id, an Arrow type Parquet cannot
-                # store, or a nested value JSON cannot represent.
-                # pyarrow's ArrowNotImplementedError subclasses
+                # store, or a nested value that resists the JSON
+                # serialization (a rejected leaf family, a colliding map
+                # key, a violated struct-shape invariant via KeyError, or
+                # a nesting depth past Python's recursion limit - all
+                # deterministic against the same batch, so acking
+                # RETRYABLE would retry forever). pyarrow's
+                # ArrowNotImplementedError subclasses
                 # NotImplementedError - not a PEP-249 fatal name - so
                 # without this wrap it would ack RETRYABLE and the batch
                 # would retry forever.
