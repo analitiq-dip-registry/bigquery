@@ -24,6 +24,28 @@ cast Arrow batch as an in-memory Parquet buffer submitted as a BigQuery
   INTO`` -> ``DROP``) with the stage fill replaced by a load job. MERGE on
   the declared conflict keys works with BigQuery's NOT ENFORCED primary
   keys.
+* **Idempotent load jobs** - every load dispatched through
+  ``write_batch`` submits under a DETERMINISTIC job id chain
+  (``analitiq_<token>_0``, ``_1``, ...) whose token hashes the batch
+  identity the CDK base already fingerprints into its stage token
+  (``run_id|stream_id|batch_seq``), the exact Parquet payload, and -
+  for truncate-insert append batches - a per-table truncate epoch.
+  BigQuery load jobs are idempotent by job id, so a retry whose
+  predecessor's client-side polling timed out ATTACHES to the
+  still-running job (or, on pure appends, resumes the committed one)
+  instead of re-submitting the rows: no duplicate appends, no
+  double-filled MERGE stage. Destructive steps (the first
+  truncate-insert batch's TRUNCATE, the MERGE stage DROP/CREATE) run
+  only after THIS batch's chain is drained to a terminal state, and
+  never resume a prior success afterwards - so no job of the batch
+  being written can commit into a freshly truncated/recreated table or
+  stand in for rows a TRUNCATE just wiped. Scope is per batch: for the
+  MERGE stage the guarantee is absolute (the stage name embeds the
+  batch identity, so only this batch's chain ever targets it); for
+  TRUNCATE, an abandoned still-running job of a DIFFERENT batch or run
+  remains a residual at-least-once window (it requires that batch to
+  exhaust its capped retries with the job still live, plus a read
+  restart - as on main, where every abandoned job had this power).
 * **Credentials** - recovered from the SAME connection state the transport
   was materialized with, via ``GetOption`` on the live ADBC database handle
   (service-account JSON for ``auth_type=service``; client id/secret/refresh
@@ -73,12 +95,16 @@ Registered under connector_id ``bigquery`` via the package entry points
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import re
+import uuid
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -181,6 +207,84 @@ def _as_fatal(exc: BaseException) -> AdbcConfigurationError:
     wrapped = AdbcConfigurationError(f"{type(exc).__name__}: {exc}")
     wrapped.__cause__ = exc
     return wrapped
+
+
+#: Upper bound on a single batch's deterministic load-job id chain
+#: (``<prefix>_0`` ... ``<prefix>_N``). The chain grows at most one link
+#: per engine retry, so a real chain never approaches this; the cap is a
+#: runaway backstop that raises retryable instead of walking forever.
+_MAX_LOAD_JOB_CHAIN = 64
+
+#: The CDK's truncate-insert write-mode name. Load-bearing: the epoch
+#: salt applies exactly when the base's own truncate branch would (the
+#: base compares the same string, generic.py's _write_batch_adbc_only).
+_TRUNCATE_INSERT = "truncate_insert"
+
+
+@dataclass(frozen=True)
+class _BatchWriteContext:
+    """Identity of the batch currently flowing through the write path.
+
+    Exactly the inputs the CDK base hashes into its collision-proof
+    stage token (``run_id|stream_id|batch_seq``), plus the write mode
+    (which decides whether the truncate epoch salts the load-job id).
+    """
+
+    run_id: str
+    stream_id: str
+    batch_seq: int
+    write_mode: str
+
+    @property
+    def salts_truncate_epoch(self) -> bool:
+        """True when this batch's job ids embed the truncate epoch.
+
+        Exactly the truncate-insert APPEND batches (``batch_seq >= 2``):
+        the first batch runs the TRUNCATE itself and never resumes a
+        prior success, so its chain needs no salt - and must stay
+        unsalted so its own retries can find it across epoch rotations.
+        """
+        return self.write_mode == _TRUNCATE_INSERT and self.batch_seq > 1
+
+
+class _ChainState(NamedTuple):
+    """Terminal state of a batch's drained load-job id chain.
+
+    Three reachable shapes: ``(0, False)`` - empty chain, submit the
+    first id; ``(n, False)`` - the last job reached a terminal failure,
+    its id is burned, submit ``_n``; ``(n, True)`` - the last job
+    committed (implies ``next_index >= 1``). A deterministic failure on
+    a non-destructive path is delivered by exception instead.
+    """
+
+    next_index: int
+    last_succeeded: bool
+
+
+#: Per-batch write context threaded from the async dispatcher
+#: (``_write_batch_adbc_only``) into the sync ingest methods, whose base
+#: signatures carry only the cast batch and address. Safety rests on the
+#: contextvars snapshot alone: ``asyncio.to_thread`` copies the calling
+#: task's context at dispatch time, so every sync ingest call reads
+#: exactly the value set by the ``_write_batch_adbc_only`` invocation
+#: that dispatched it - even with concurrent streams on this shared
+#: handler instance, and even if an abandoned attempt's worker thread
+#: outlives its ack deadline and overlaps a newer attempt.
+_CURRENT_BATCH: ContextVar[_BatchWriteContext | None] = ContextVar(
+    "bigquery_current_batch", default=None
+)
+
+
+def _epoch_key(address: TableAddress) -> tuple[str, str, str]:
+    """Truncate-epoch dict key: the destination table's identity.
+
+    Keyed by table rather than stream because the hazard the epoch
+    guards is per-table (a TRUNCATE empties one table), and because the
+    stream id is not available on every TRUNCATE entry point (the
+    base's empty-first-batch ``_truncate_only`` path runs outside the
+    ``_write_batch_adbc_only`` dispatch and its ContextVar).
+    """
+    return (address.catalog or "", address.schema or "", address.table)
 
 
 class BigQueryDialect(SqlDialect):
@@ -375,8 +479,72 @@ class BigQueryConnector(GenericSQLConnector):
         # service-account key's. May differ from the client's billing
         # project (billing_project_id).
         self._bq_data_project: str = ""
+        # Per-table truncate epoch: rotated on EVERY TRUNCATE (the
+        # _adbc_truncate_sync override is the single choke point both
+        # truncate entry points share - the first-batch
+        # truncate-then-ingest path AND the base's empty-first-batch
+        # _truncate_only path), salted into the deterministic load-job
+        # ids of truncate_insert append batches (batch_seq >= 2).
+        # batch_seq restarts at 1 when the engine restarts a read and
+        # the first batch re-runs TRUNCATE - without the epoch, an
+        # append batch of the new refresh incarnation could attach to
+        # the identical-content job of the OLD incarnation (whose rows
+        # that TRUNCATE just wiped) and silently skip its load. Keyed
+        # by destination table (_epoch_key), not stream: the hazard is
+        # per-table and the stream id is not available on the
+        # _truncate_only path. In-memory only, matching the hazard's
+        # scope; mutated only under _adbc_op_lock.
+        self._bq_truncate_epochs: dict[tuple[str, str, str], str] = {}
+        # Dataset locations resolved via get_dataset, cached per
+        # (project, dataset). BigQuery's jobs.get requires the job
+        # location outside the US/EU multi-regions, while jobs.insert
+        # infers it from the dataset - so the attach/resume machinery
+        # must pass it explicitly or regional retries would see
+        # NotFound for jobs that exist. A dataset's location is
+        # immutable in BigQuery, so the cache never invalidates and
+        # deliberately survives client rebuilds.
+        self._bq_dataset_locations: dict[tuple[str, str], str] = {}
 
     # ---- write path: load jobs replace cursor.adbc_ingest ------------------
+    async def _write_batch_adbc_only(
+        self,
+        state: Any,
+        run_id: str,
+        stream_id: str,
+        batch_seq: int,
+        record_batch: pa.RecordBatch,
+        truncate_now: bool,
+    ) -> None:
+        """Thread the batch identity into the sync ingest overrides.
+
+        The base derives its collision-proof stage token from
+        ``(run_id, stream_id, batch_seq)`` but hands the sync ingest
+        methods only the cast batch and address; the deterministic
+        load-job ids need that same identity. This override publishes it
+        via ``_CURRENT_BATCH`` (see the ContextVar's own comment for why
+        that is safe under concurrent streams) and delegates everything
+        else to the base dispatch.
+        """
+        token = _CURRENT_BATCH.set(
+            _BatchWriteContext(
+                run_id=run_id,
+                stream_id=stream_id,
+                batch_seq=batch_seq,
+                write_mode=state.write_mode,
+            )
+        )
+        try:
+            await super()._write_batch_adbc_only(
+                state,
+                run_id,
+                stream_id,
+                batch_seq,
+                record_batch,
+                truncate_now,
+            )
+        finally:
+            _CURRENT_BATCH.reset(token)
+
     def _adbc_only_ingest_sync(
         self,
         cast_batch: pa.RecordBatch,
@@ -387,17 +555,81 @@ class BigQueryConnector(GenericSQLConnector):
         Overrides the base's ``cursor.adbc_ingest`` append (the BigQuery
         ADBC driver rejects every ``adbc.ingest.*`` statement option, and
         DML INSERT writes are quota-bound and costly). Serves keyed
-        insert and truncate-insert appends: only the FIRST
-        truncate-insert batch routes through the base's
-        ``_truncate_then_ingest_sync`` (TRUNCATE as SQL over the ADBC
-        connection, then this method); every subsequent batch of the
-        stream calls here directly. The lock acquire mirrors the base:
-        ``_adbc_op_lock`` is reentrant for the truncate-then-ingest
-        composition.
+        insert and truncate-insert appends after the first batch (the
+        FIRST truncate-insert batch routes through this class's
+        ``_truncate_then_ingest_sync`` override instead). Pure appends
+        resume a previously committed load job (no destructive
+        preparation). The justification differs by mode: for keyed
+        inserts nothing ever removes appended rows, so a chain success
+        proves this exact payload already sits in the target exactly
+        once; for truncate-insert appends the epoch salt in the job id
+        guarantees a chain success post-dates the last TRUNCATE
+        (``_adbc_truncate_sync`` rotates the epoch), so the resumed
+        rows cannot have been wiped.
         """
         with self._adbc_op_lock:
             conn = self._reopen_adbc_if_needed_sync()
             self._load_batch_via_load_job_sync(conn, cast_batch, address)
+
+    def _adbc_truncate_sync(self, address: TableAddress) -> None:
+        """TRUNCATE via the base, then rotate the table's truncate epoch.
+
+        The single choke point every TRUNCATE flows through - both the
+        first-batch ``_truncate_then_ingest_sync`` composition and the
+        base's empty-first-batch ``_truncate_only`` short-circuit
+        (which runs OUTSIDE the ``_write_batch_adbc_only`` dispatch, so
+        it cannot rely on ``_CURRENT_BATCH``; the epoch dict is keyed
+        by table for exactly that reason). The invariant this enforces:
+        no code path that empties the target leaves its epoch
+        unchanged - otherwise an identical-content append batch of the
+        new refresh incarnation could resume the wiped incarnation's
+        committed job and silently skip its load.
+        """
+        with self._adbc_op_lock:
+            super()._adbc_truncate_sync(address)
+            self._bq_truncate_epochs[_epoch_key(address)] = uuid.uuid4().hex
+
+    def _truncate_then_ingest_sync(
+        self,
+        cast_batch: pa.RecordBatch,
+        address: TableAddress,
+    ) -> None:
+        """TRUNCATE, then load the first truncate-insert batch, idempotently.
+
+        Overrides the base composition (TRUNCATE via SQL, then the plain
+        append ingest) because that shape interacts with deterministic
+        load-job ids: the engine re-runs TRUNCATE on every retry of the
+        first batch (``truncate_now`` is recomputed as ``batch_seq ==
+        1``), so
+
+        * an abandoned still-running load job from a previous attempt
+          could commit AFTER this attempt's TRUNCATE, duplicating the
+          batch (the polling-timeout race this chain scheme exists to
+          close), and
+        * a job that already committed on a previous attempt has just
+          had its rows wiped by this attempt's TRUNCATE, so a chain
+          success must NOT count as "the batch is in the table"
+          (``resume_committed=False``).
+
+        The fix is drain-then-truncate-then-fresh-load, expressed via
+        the load method's destructive-preparation hook: the job chain
+        drains to a terminal state first (any in-flight commit lands
+        BEFORE the TRUNCATE and is wiped with everything else), then
+        the hook runs this class's ``_adbc_truncate_sync`` (TRUNCATE
+        plus epoch rotation, so append batches of the wiped refresh
+        incarnation can never satisfy this incarnation's job ids), and
+        a fresh job id always loads the current payload.
+        ``_adbc_op_lock`` is reentrant for the inner acquires,
+        mirroring the base.
+        """
+        with self._adbc_op_lock:
+            conn = self._reopen_adbc_if_needed_sync()
+            self._load_batch_via_load_job_sync(
+                conn,
+                cast_batch,
+                address,
+                destructive_prepare=lambda: self._adbc_truncate_sync(address),
+            )
 
     def _merge_ingest_locked_sync(
         self,
@@ -413,37 +645,56 @@ class BigQueryConnector(GenericSQLConnector):
     ) -> None:
         """Upsert body with the stage ingest replaced by a load job.
 
-        Keeps the base's statement sequence and idempotency shape exactly:
+        Keeps the base's statement sequence and idempotency shape:
         pre-flight ``DROP TABLE IF EXISTS`` (so a retry of the same batch
         finds a clean slate), ``CREATE TABLE ... LIKE`` stage clone, fill
         the stage, ``MERGE INTO`` the target on *conflict_keys* (BigQuery
         PKs are NOT ENFORCED - the MERGE needs only the ON clause), DROP
-        the stage, with best-effort cleanup on failure. Only the fill step
-        differs: a Parquet load job instead of ``cursor.adbc_ingest``. One
-        deliberate SQL deviation from the base composition: GoogleSQL
-        rejects a target-alias prefix on MERGE's ``UPDATE SET`` assignment
-        targets, so the SET items are unqualified (``SET col = s.col``);
-        the ON / INSERT clauses keep the alias-qualified form. Runs with
-        ``_adbc_op_lock`` held (acquired by the base's
+        the stage, with best-effort cleanup on failure. Two deliberate
+        deviations from the base composition:
+
+        * The fill is a Parquet load job instead of
+          ``cursor.adbc_ingest``, and the pre-flight DROP/CREATE runs
+          INSIDE the load sequence (the destructive-preparation hook),
+          after the batch's deterministic job chain has drained to a
+          terminal state - so an abandoned still-running load job from
+          a previous attempt can never commit into the freshly
+          recreated stage (the double-fill that made ``MERGE``
+          multi-match). A chain success is never resumed on this path:
+          the recreate just wiped the stage, so a fresh job id always
+          re-fills it.
+        * GoogleSQL rejects a target-alias prefix on MERGE's ``UPDATE
+          SET`` assignment targets, so the SET items are unqualified
+          (``SET col = s.col``); the ON / INSERT clauses keep the
+          alias-qualified form.
+
+        Runs with ``_adbc_op_lock`` held (acquired by the base's
         ``_merge_ingest_sync``, which also derives the collision-proof
         stage name and calls here).
         """
         conn = self._reopen_adbc_if_needed_sync()
         try:
-            cursor = conn.cursor()
-            try:
-                cursor.execute(f"DROP TABLE IF EXISTS {stage_qualified}")
-                cursor.execute(
-                    self.dialect.adbc_stage_table_sql(
-                        stage_qualified, target_qualified
+
+            def recreate_stage() -> None:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(f"DROP TABLE IF EXISTS {stage_qualified}")
+                    cursor.execute(
+                        self.dialect.adbc_stage_table_sql(
+                            stage_qualified, target_qualified
+                        )
                     )
-                )
-                conn.commit()
-            finally:
-                _close_cursor_quietly(cursor)
+                    conn.commit()
+                finally:
+                    _close_cursor_quietly(cursor)
 
             # Fill the stage (replaces the base's cursor.adbc_ingest).
-            self._load_batch_via_load_job_sync(conn, cast_batch, stage_address)
+            self._load_batch_via_load_job_sync(
+                conn,
+                cast_batch,
+                stage_address,
+                destructive_prepare=recreate_stage,
+            )
 
             on_clause = " AND ".join(
                 f"t.{self.dialect.quote_ident(k)} = s.{self.dialect.quote_ident(k)}"
@@ -548,16 +799,56 @@ class BigQueryConnector(GenericSQLConnector):
         conn: Any,
         cast_batch: pa.RecordBatch,
         address: TableAddress,
+        *,
+        destructive_prepare: Callable[[], None] | None = None,
     ) -> None:
-        """Run one ``WRITE_APPEND`` Parquet load job into *address*.
+        """Load one cast batch into *address* via an idempotent job chain.
 
         Called under ``_adbc_op_lock``. The batch is written to an
         in-memory Parquet buffer and shipped as a direct media upload -
-        no GCS staging bucket, no new connection inputs.
+        no GCS staging bucket, no new connection inputs - under a
+        DETERMINISTIC job id (see ``_load_job_id_prefix``). BigQuery
+        load jobs are idempotent by job id, which closes the
+        polling-timeout duplication race: when a previous attempt's
+        client-side polling died (classified retryable) while the job
+        kept running server-side, this attempt finds that job in the
+        chain and ATTACHES to it instead of re-submitting the same rows.
+
+        Sequence: serialize -> drain the chain (``<prefix>_0``,
+        ``<prefix>_1``, ... - a still-running last job is polled to its
+        terminal state) -> maybe resume -> *destructive_prepare* ->
+        submit the next id -> poll.
+
+        *destructive_prepare* is the whole mode switch, and ``None`` vs
+        set are the only two states:
+
+        * ``None`` - pure append. A chain whose last job committed
+          means this payload provably sits in the target exactly once:
+          return without loading anything.
+        * set - the caller must destroy-and-recreate the load target
+          first (the first truncate-insert batch's TRUNCATE; the MERGE
+          fill's stage DROP/CREATE). A prior chain success then proves
+          nothing about the CURRENT table contents, so the hook runs
+          and a fresh job id always loads the current payload. The
+          drain-before-hook ordering is load-bearing: the destructive
+          step only runs once no job of THIS batch's chain can commit
+          after it. (Jobs of other abandoned batches are outside the
+          chain's scope - see the module docstring's residual-window
+          note.)
+
+        Collapsing "resume?" and "prepare" into the one parameter makes
+        the two corrupt combinations unrepresentable: resuming past a
+        pending destructive step, and fresh-submitting a committed pure
+        append.
+
+        Without batch context (a direct call outside the
+        ``_write_batch_adbc_only`` dispatch - defensive only) the job id
+        falls back to a client-generated one: the pre-idempotency,
+        at-least-once behavior, WARNING-logged because idempotency is
+        silently absent.
 
         Failure classification (the base ``write_batch`` acks RETRYABLE
-        for anything not ``AdbcConfigurationError``-shaped, and retries
-        have no cap):
+        for anything not ``AdbcConfigurationError``-shaped):
 
         * Building the table reference and serializing the batch to
           Parquet involve no network - any failure there is deterministic
@@ -613,18 +904,55 @@ class BigQueryConnector(GenericSQLConnector):
                     f"{address} failed before upload (building the table "
                     f"reference / serializing the batch to Parquet): {exc}"
                 ) from exc
-            buffer.seek(0)
-            job_config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.PARQUET,
-                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-                # The engine creates destination tables via DDL before the
-                # first batch; a missing table is a defect that must fail
-                # loud, never be re-created from a Parquet-inferred schema.
-                create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
+            location = self._bq_dataset_location_sync(client, destination)
+            job_id_prefix = self._load_job_id_prefix(
+                buffer.getbuffer(), address
             )
-            client.load_table_from_file(
-                buffer, destination, job_config=job_config
-            ).result()
+            if job_id_prefix is None:
+                logger.warning(
+                    "BigQuery load into %s has no batch write context; "
+                    "falling back to a client-generated job id - this "
+                    "load is NOT idempotent across polling-timeout "
+                    "retries (at-least-once)",
+                    address,
+                )
+                if destructive_prepare is not None:
+                    destructive_prepare()
+                self._submit_and_poll_load_job(
+                    client,
+                    buffer,
+                    destination,
+                    job_id=None,
+                    location=location,
+                    destructive=destructive_prepare is not None,
+                )
+                return
+            chain = self._drain_load_job_chain_sync(
+                client,
+                job_id_prefix,
+                location=location,
+                destructive=destructive_prepare is not None,
+            )
+            if chain.last_succeeded and destructive_prepare is None:
+                logger.info(
+                    "BigQuery load job %s_%d already loaded this batch "
+                    "into %s on a previous attempt; resuming its success "
+                    "instead of re-submitting",
+                    job_id_prefix,
+                    chain.next_index - 1,
+                    address,
+                )
+                return
+            if destructive_prepare is not None:
+                destructive_prepare()
+            self._submit_and_poll_load_job(
+                client,
+                buffer,
+                destination,
+                job_id=f"{job_id_prefix}_{chain.next_index}",
+                location=location,
+                destructive=destructive_prepare is not None,
+            )
         except AdbcConfigurationError:
             self._drop_bigquery_client_sync()
             raise
@@ -636,6 +964,283 @@ class BigQueryConnector(GenericSQLConnector):
                     f"{address} failed deterministically: {exc}"
                 ) from exc
             raise
+
+    def _load_job_id_prefix(
+        self,
+        parquet_payload: bytes | memoryview,
+        address: TableAddress,
+    ) -> str | None:
+        """Deterministic load-job id prefix for the current batch.
+
+        ``None`` when no batch context is set (a direct call outside the
+        ``_write_batch_adbc_only`` dispatch) - the caller then falls
+        back to a client-generated job id.
+
+        The token binds:
+
+        * the batch identity ``run_id|stream_id|batch_seq`` - the same
+          inputs the CDK base hashes into its collision-proof stage
+          token;
+        * the target table's truncate epoch, for truncate_insert
+          batches after the first (``salts_truncate_epoch``; see the
+          ``_bq_truncate_epochs`` comment for the wipe hazard it
+          closes). Generated on demand so a destination restart
+          mid-stream starts a fresh epoch - degrading those batches to
+          the pre-idempotency at-least-once behavior instead of risking
+          a false resume;
+        * a SHA-256 of the exact Parquet payload, so an id can only
+          ever attach to a job that loaded these very bytes. Engine
+          retries resend the identical record batch (and the cast and
+          Parquet encode are deterministic in-process), so retries land
+          on the same chain; a restarted read that produces different
+          bytes gets a different chain and simply loads them.
+
+        32 hex chars (128 bits) keep accidental collision with any
+        other job in the project's global, long-retention job namespace
+        out of consideration.
+        """
+        ctx = _CURRENT_BATCH.get()
+        if ctx is None:
+            return None
+        epoch = ""
+        if ctx.salts_truncate_epoch:
+            epoch = self._bq_truncate_epochs.setdefault(
+                _epoch_key(address), uuid.uuid4().hex
+            )
+        content_hash = hashlib.sha256(parquet_payload).hexdigest()
+        token = hashlib.sha256(
+            f"{ctx.run_id}|{ctx.stream_id}|{ctx.batch_seq}|{epoch}|"
+            f"{content_hash}".encode()
+        ).hexdigest()[:32]
+        return f"analitiq_{token}"
+
+    def _bq_dataset_location_sync(
+        self, client: bigquery.Client, destination: bigquery.TableReference
+    ) -> str | None:
+        """Resolve (and cache) the destination dataset's location.
+
+        ``jobs.insert`` infers the location from the dataset, but
+        ``jobs.get`` requires it outside the US/EU multi-regions - a
+        location-blind lookup returns NotFound for jobs that exist,
+        which would silently disable the attach/resume machinery for
+        regional datasets and FATAL the Conflict fallback. Resolution
+        failures propagate through the caller's classification (a
+        missing dataset is deterministic; network trouble retryable).
+        """
+        from google.cloud import bigquery
+
+        key = (destination.project, destination.dataset_id)
+        location = self._bq_dataset_locations.get(key)
+        if location is None:
+            location = (
+                client.get_dataset(
+                    bigquery.DatasetReference(*key)
+                ).location
+                or ""
+            )
+            self._bq_dataset_locations[key] = location
+        return location or None
+
+    def _drain_load_job_chain_sync(
+        self,
+        client: bigquery.Client,
+        job_id_prefix: str,
+        *,
+        location: str | None,
+        destructive: bool,
+    ) -> _ChainState:
+        """Walk this batch's job-id chain to a terminal state.
+
+        Only the LAST existing job can be non-terminal - a new id is
+        only ever submitted after the walk drained its predecessor to a
+        terminal state - so the walk polls that one job to completion
+        when needed: the "attach" that replaces re-submission.
+
+        The except branch distinguishes THE JOB failing from OUR
+        POLLING failing, because burning a live job's id reopens the
+        duplication race this chain exists to close: after any poll
+        exception the job is reloaded, and only a job that provably
+        reached DONE has a terminal outcome. A non-DONE (or
+        unreloadable) job re-raises - the batch acks RETRYABLE and the
+        next attempt re-attaches to the SAME id. A genuinely failed job
+        committed nothing (load jobs are atomic): on a *destructive*
+        path its id is burned even for a deterministically-classified
+        error, because that error can be self-inflicted by a prior
+        attempt's cleanup (the stage DROP after a polling timeout makes
+        the abandoned job die with notFound) - the destructive
+        preparation recreates the preconditions and the fresh
+        submission re-classifies a genuine defect correctly, at the
+        cost of one wasted upload. On the append path nothing destroys
+        a job's preconditions, so a deterministic stored error is
+        genuine and re-raises (fatal in the caller).
+        """
+        from google.api_core import exceptions as api_exceptions
+
+        index = 0
+        last_job: Any = None
+        while True:
+            if index >= _MAX_LOAD_JOB_CHAIN:
+                raise RuntimeError(
+                    f"BigQuery load-job chain {job_id_prefix} reached "
+                    f"{_MAX_LOAD_JOB_CHAIN} ids without a terminal "
+                    "success; refusing to extend it this attempt. "
+                    "Investigate why this table's load jobs keep "
+                    "failing transiently (all chain ids share this "
+                    "prefix in the project's job history); the engine's "
+                    "retry cap bounds further attempts"
+                )
+            try:
+                job = client.get_job(
+                    f"{job_id_prefix}_{index}", location=location
+                )
+            except api_exceptions.NotFound:
+                break
+            if last_job is not None and last_job.state != "DONE":
+                # Violates the chain invariant; observable, not fatal -
+                # the walk still only acts on the last job.
+                logger.warning(
+                    "BigQuery load-job chain %s has a non-terminal "
+                    "non-last job %s (state %s); the chain invariant "
+                    "expects only the last id to be in flight",
+                    job_id_prefix,
+                    last_job.job_id,
+                    last_job.state,
+                )
+            last_job = job
+            index += 1
+        if last_job is None:
+            return _ChainState(0, False)
+        if last_job.state != "DONE":
+            logger.info(
+                "Attaching to in-flight BigQuery load job %s from a "
+                "previous attempt (client-side polling was interrupted; "
+                "the job kept running server-side)",
+                last_job.job_id,
+            )
+        try:
+            last_job.result()
+        except Exception as exc:
+            done, succeeded = self._job_terminal_state(last_job)
+            if not done:
+                # OUR polling (or the state reload) failed - the job
+                # may still be running and may yet commit. Never
+                # advance past a live job: re-raise so the engine backs
+                # off and the next attempt re-attaches to this same id.
+                raise
+            if succeeded:
+                # The poll error was ours; the job itself committed.
+                return _ChainState(index, True)
+            if not destructive and self._is_deterministic_google_error(
+                exc
+            ):
+                raise
+            logger.warning(
+                "BigQuery load job %s reached a terminal failure on a "
+                "previous attempt; its id is burned and the next id in "
+                "the chain will be submitted (failed load jobs commit "
+                "nothing)",
+                last_job.job_id,
+                exc_info=True,
+            )
+            return _ChainState(index, False)
+        return _ChainState(index, True)
+
+    @staticmethod
+    def _job_terminal_state(job: Any) -> tuple[bool, bool]:
+        """(reached DONE, succeeded) for *job*, refreshed best-effort.
+
+        The reload targets the job's own stored project/location, so no
+        location plumbing is needed. When the reload itself fails, the
+        job's LOCALLY cached state still decides: ``result()`` refreshes
+        the job before raising a stored job error, so a locally-DONE job
+        with an ``error_result`` is provably terminal even without a
+        fresh reload - without this fallback, a network blip on the
+        reload would convert a burnable destructive-path failure into a
+        spurious FATAL. A pure polling failure leaves the local state
+        non-DONE, preserving the conservative "possibly live" re-raise
+        exactly where it matters.
+        """
+        try:
+            job.reload()
+        except Exception:
+            logger.debug(
+                "BigQuery job %s state reload failed after a polling "
+                "error; falling back to the locally cached job state",
+                getattr(job, "job_id", "<unknown>"),
+                exc_info=True,
+            )
+        done = job.state == "DONE"
+        return done, done and job.error_result is None
+
+    def _submit_and_poll_load_job(
+        self,
+        client: bigquery.Client,
+        buffer: io.BytesIO,
+        destination: bigquery.TableReference,
+        *,
+        job_id: str | None,
+        location: str | None,
+        destructive: bool,
+    ) -> None:
+        """Submit one ``WRITE_APPEND`` Parquet load job and poll it done.
+
+        With a deterministic *job_id*, an ``Already Exists: Job``
+        conflict means a previous submission of this very id reached
+        the server anyway - either this attempt's own insert response
+        was lost and the HTTP layer retried past it (attach is safe:
+        that job loaded this payload after any destructive step), or a
+        PREVIOUS attempt's job that the chain walk's ``get_job`` did
+        not see. The two are indistinguishable here, and on a
+        *destructive* path the second case is lethal to attach to: the
+        pre-existing job's rows either committed before the destructive
+        step (just wiped - attaching would ack success for absent rows)
+        or will commit after it under an id the chain considers spent.
+        So: append path attaches and polls; destructive path raises
+        RETRYABLE (a plain RuntimeError - the raw Conflict's
+        ``duplicate`` reason would classify FATAL) so the next
+        attempt's drain sees the now-visible job and handles it under
+        the normal drain-then-destroy ordering, which is
+        self-correcting. ``job_id=None`` submits under a
+        client-generated id (the no-batch-context fallback), where a
+        conflict is a genuine error.
+        """
+        from google.api_core import exceptions as api_exceptions
+        from google.cloud import bigquery
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            # The engine creates destination tables via DDL before the
+            # first batch; a missing table is a defect that must fail
+            # loud, never be re-created from a Parquet-inferred schema.
+            create_disposition=bigquery.CreateDisposition.CREATE_NEVER,
+        )
+        buffer.seek(0)
+        try:
+            client.load_table_from_file(
+                buffer,
+                destination,
+                job_config=job_config,
+                job_id=job_id,
+                location=location,
+            ).result()
+        except api_exceptions.Conflict as exc:
+            if job_id is None:
+                raise
+            if destructive:
+                raise RuntimeError(
+                    f"BigQuery load job {job_id} already existed when "
+                    "submitted after a destructive preparation step "
+                    "(the chain walk raced its visibility); retrying "
+                    "so the next attempt drains it before the "
+                    "destructive step re-runs"
+                ) from exc
+            logger.info(
+                "BigQuery load job %s already exists; attaching to the "
+                "prior submission",
+                job_id,
+            )
+            client.get_job(job_id, location=location).result()
 
     def _bigquery_client_sync(self, conn: Any) -> bigquery.Client:
         """Return the cached load-job client, building it on first use.
