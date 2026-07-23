@@ -1147,23 +1147,28 @@ class BigQueryConnector(GenericSQLConnector):
 
     @staticmethod
     def _job_terminal_state(job: Any) -> tuple[bool, bool]:
-        """(reached DONE, succeeded) for *job*, via a fresh reload.
+        """(reached DONE, succeeded) for *job*, refreshed best-effort.
 
-        An unreloadable job reports ``(False, False)`` - the caller
-        must treat it as possibly still running. The reload targets the
-        job's own stored project/location, so no location plumbing is
-        needed here.
+        The reload targets the job's own stored project/location, so no
+        location plumbing is needed. When the reload itself fails, the
+        job's LOCALLY cached state still decides: ``result()`` refreshes
+        the job before raising a stored job error, so a locally-DONE job
+        with an ``error_result`` is provably terminal even without a
+        fresh reload - without this fallback, a network blip on the
+        reload would convert a burnable destructive-path failure into a
+        spurious FATAL. A pure polling failure leaves the local state
+        non-DONE, preserving the conservative "possibly live" re-raise
+        exactly where it matters.
         """
         try:
             job.reload()
         except Exception:
             logger.debug(
                 "BigQuery job %s state reload failed after a polling "
-                "error; treating the job as possibly live",
+                "error; falling back to the locally cached job state",
                 getattr(job, "job_id", "<unknown>"),
                 exc_info=True,
             )
-            return False, False
         done = job.state == "DONE"
         return done, done and job.error_result is None
 
