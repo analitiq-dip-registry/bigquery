@@ -4,13 +4,13 @@
 [![Latest release](https://img.shields.io/github/v/release/analitiq-dip-registry/bigquery)](https://github.com/analitiq-dip-registry/bigquery/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-Read schemas, tables, and views from Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver.
+Read from and write to Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver (reads) and Parquet load jobs (writes).
 
 ## What is this?
 
 This is a **connector** — a configuration that defines how to authenticate with Google BigQuery and what data is available for reading and writing. It does not move data by itself. Instead, it is used by the [Analitiq](https://analitiq-app.com) data integration platform or the open-source `analitiq-dip-registry` engine to set up data pipelines.
 
-This is a **database** connector: it connects over the engine's ADBC BigQuery driver (`transport_type: adbc`, `driver: bigquery`) and discovers tables and column types at runtime from BigQuery's `INFORMATION_SCHEMA` — so there are no per-endpoint definition files.
+This is a **database** connector: it connects over the engine's ADBC BigQuery driver (`transport_type: adbc`, `driver: bigquery`) and discovers tables and column types at runtime from BigQuery's `INFORMATION_SCHEMA` — so there are no per-endpoint definition files. Writes follow the industry-standard load-job pattern: each batch ships as an in-memory Parquet buffer submitted as a BigQuery load job (no GCS staging bucket needed), with upserts staged and `MERGE`d on the declared keys.
 
 ## How to use this connector
 
@@ -47,7 +47,6 @@ BigQuery does **not** use a username and password and does **not** support API k
 
 - **`service` (default)** — paste the full contents of a service-account JSON key into the **Service Account JSON Key** field. This is the recommended path for automated pipelines.
 - **`user`** — supply an OAuth **client ID**, **client secret**, and **refresh token**.
-- **`aad`** — supply a Microsoft Entra ID **access token** (and optionally an audience URI).
 
 All traffic goes to `googleapis.com` over TLS, which is always on.
 
@@ -67,14 +66,14 @@ This is a database connector — it does not ship a fixed list of endpoints. Ins
 
 | Resource | How it's discovered | Description |
 |----------|---------------------|-------------|
-| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map.json`. |
+| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map-read.json` (write direction: `definition/type-map-write.json`). |
 
 ## Limitations
 
 - **No TCP port** — BigQuery is an HTTPS REST API; there is no host or port to configure.
 - **Quotas & limits** — BigQuery enforces per-project quotas (concurrent queries, query length, API request rates, response size). Concrete values vary by project and edition; see the [BigQuery quotas documentation](https://cloud.google.com/bigquery/quotas).
 - **Type mapping** — `BIGNUMERIC` maps to `Decimal256`; `GEOGRAPHY` and `INTERVAL` are surfaced as text (`Utf8`); `ARRAY`, `STRUCT`, and `RANGE` are surfaced as `Json`.
-- **Default dataset** — `dataset_id` scopes discovery but is not passed as an ADBC driver option.
+- **Default dataset** — `dataset_id` scopes discovery and is passed to the driver as `adbc.bigquery.sql.dataset_id`.
 
 ## For AI agents
 
