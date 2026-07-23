@@ -53,10 +53,14 @@ cast Arrow batch as an in-memory Parquet buffer submitted as a BigQuery
 * **Load-job type limits** - Json-family canonicals (``Json``, ``Object``,
   the nested ``List``/``Struct``/``Map`` forms) render ``STRING`` DDL: the
   CDK ships ``Json`` values as Parquet ``STRING``, and BigQuery batch load
-  jobs cannot populate ``JSON`` columns from Parquet. ``Duration`` and
-  ``Interval`` canonicals are rejected at CREATE TABLE time
-  (``render_column_type``): BigQuery INTERVAL cannot be populated by a
-  Parquet load job at all.
+  jobs cannot populate ``JSON`` columns from Parquet. Columns that
+  materialize as genuine Arrow struct/list/map values (an endpoint column
+  declared with a real ``properties``/``items`` sub-schema) are serialized
+  to JSON text before the Parquet write (``_jsonify_nested_columns``), so
+  every Json-family column lands as ``STRING`` regardless of how it
+  materialized. ``Duration`` and ``Interval`` canonicals are rejected at
+  CREATE TABLE time (``render_column_type``): BigQuery INTERVAL cannot be
+  populated by a Parquet load job at all.
 
 Everything else BigQuery-specific lives here:
 
@@ -95,15 +99,19 @@ Registered under connector_id ``bigquery`` via the package entry points
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
 import logging
+import math
 import re
 import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import TYPE_CHECKING, NamedTuple
 
 import pyarrow as pa
@@ -285,6 +293,134 @@ def _epoch_key(address: TableAddress) -> tuple[str, str, str]:
     ``_write_batch_adbc_only`` dispatch and its ContextVar).
     """
     return (address.catalog or "", address.schema or "", address.table)
+
+
+#: Arrow type predicates for columns that must be serialized to JSON text
+#: before the Parquet write: a genuine struct/list/map column loads into
+#: neither a ``JSON`` nor a ``STRING`` BigQuery column via a Parquet load
+#: job, while the Json-family DDL this connector renders is ``STRING``.
+#: Deliberately narrower than ``pa.types.is_nested`` (unions are not a
+#: Json-family materialization and stay untouched for the load job to
+#: reject loudly).
+_NESTED_TYPE_CHECKS = (
+    pa.types.is_struct,
+    pa.types.is_map,
+    pa.types.is_list,
+    pa.types.is_large_list,
+    pa.types.is_fixed_size_list,
+)
+
+
+def _needs_json_serialization(dtype: pa.DataType) -> bool:
+    """True when a column of *dtype* must become JSON text to be loadable."""
+    return any(check(dtype) for check in _NESTED_TYPE_CHECKS)
+
+
+def _json_safe_scalar(value: Any) -> Any:
+    """Convert one leaf value from ``to_pylist`` output to a JSON value.
+
+    Mirrors the common JSON conventions for types JSON cannot represent
+    natively: temporal values become ISO-8601 text (aware timestamps keep
+    their offset), Decimals become strings (float would silently lose
+    precision), binary becomes base64 text, and non-finite floats become
+    null (strict JSON has no NaN/Infinity, and BigQuery's ``PARSE_JSON``
+    rejects them). The ``str`` fallback keeps the conversion total - an
+    exotic leaf degrades to its text form instead of failing the batch.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    return str(value)
+
+
+def _json_safe_value(value: Any, dtype: pa.DataType) -> Any:
+    """Recursively convert a ``to_pylist`` value to a JSON-dumpable one.
+
+    Walks the Arrow type alongside the Python value so map entries are
+    recognized structurally: ``to_pylist`` yields a map as a list of
+    ``(key, item)`` tuples, which must become a JSON object (keys coerced
+    to text - JSON object keys are always strings), never a list of
+    two-element arrays. Struct fields are read via ``dict.get`` so an
+    absent key degrades to null instead of raising.
+    """
+    if value is None:
+        return None
+    if pa.types.is_dictionary(dtype):
+        return _json_safe_value(value, dtype.value_type)
+    if pa.types.is_struct(dtype):
+        return {
+            field.name: _json_safe_value(value.get(field.name), field.type)
+            for field in dtype
+        }
+    if pa.types.is_map(dtype):
+        entries = {}
+        for key, item in value:
+            safe_key = _json_safe_scalar(key)
+            if not isinstance(safe_key, str):
+                safe_key = str(safe_key)
+            entries[safe_key] = _json_safe_value(item, dtype.item_type)
+        return entries
+    if (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+    ):
+        return [_json_safe_value(item, dtype.value_type) for item in value]
+    return _json_safe_scalar(value)
+
+
+def _jsonify_nested_columns(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Serialize struct/list/map columns to JSON text before Parquet.
+
+    The write map renders every Json-family canonical (``Json``,
+    ``Object``, the nested ``List``/``Struct``/``Map`` forms) as
+    ``STRING`` DDL, and opaque ``Json`` values already ship as Parquet
+    ``STRING`` - that round-trips cleanly. But an endpoint column
+    declared ``Object`` with a real ``properties`` sub-schema (or
+    ``List`` with ``items``) materializes as a genuine Arrow struct/list
+    in the cast batch, which a Parquet load job can populate into
+    neither a ``JSON`` nor a ``STRING`` column - the load job fails.
+    Serializing those columns to compact JSON text here makes every
+    Json-family column land as ``STRING`` regardless of how it
+    materialized. Null slots stay NULL (not the text ``"null"``); the
+    original field nullability and any schema/field metadata are
+    preserved.
+    """
+    nested_indices = [
+        index
+        for index in range(batch.num_columns)
+        if _needs_json_serialization(batch.schema.field(index).type)
+    ]
+    if not nested_indices:
+        return batch
+    columns = list(batch.columns)
+    fields = [batch.schema.field(index) for index in range(batch.num_columns)]
+    for index in nested_indices:
+        field = fields[index]
+        texts = [
+            None
+            if value is None
+            else json.dumps(
+                _json_safe_value(value, field.type),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for value in columns[index].to_pylist()
+        ]
+        columns[index] = pa.array(texts, type=pa.string())
+        fields[index] = pa.field(
+            field.name, pa.string(), nullable=field.nullable, metadata=field.metadata
+        )
+    return pa.RecordBatch.from_arrays(
+        columns, schema=pa.schema(fields, metadata=batch.schema.metadata)
+    )
 
 
 class BigQueryDialect(SqlDialect):
@@ -804,15 +940,18 @@ class BigQueryConnector(GenericSQLConnector):
     ) -> None:
         """Load one cast batch into *address* via an idempotent job chain.
 
-        Called under ``_adbc_op_lock``. The batch is written to an
-        in-memory Parquet buffer and shipped as a direct media upload -
-        no GCS staging bucket, no new connection inputs - under a
-        DETERMINISTIC job id (see ``_load_job_id_prefix``). BigQuery
-        load jobs are idempotent by job id, which closes the
-        polling-timeout duplication race: when a previous attempt's
-        client-side polling died (classified retryable) while the job
-        kept running server-side, this attempt finds that job in the
-        chain and ATTACHES to it instead of re-submitting the same rows.
+        Called under ``_adbc_op_lock``. Struct/list/map columns are
+        first serialized to JSON text (``_jsonify_nested_columns`` -
+        their DDL is ``STRING``, which a Parquet nested column cannot
+        populate), then the batch is written to an in-memory Parquet
+        buffer and shipped as a direct media upload - no GCS staging
+        bucket, no new connection inputs - under a DETERMINISTIC job id
+        (see ``_load_job_id_prefix``). BigQuery load jobs are idempotent
+        by job id, which closes the polling-timeout duplication race:
+        when a previous attempt's client-side polling died (classified
+        retryable) while the job kept running server-side, this attempt
+        finds that job in the chain and ATTACHES to it instead of
+        re-submitting the same rows.
 
         Sequence: serialize -> drain the chain (``<prefix>_0``,
         ``<prefix>_1``, ... - a still-running last job is polled to its
@@ -886,23 +1025,26 @@ class BigQueryConnector(GenericSQLConnector):
                     ),
                     address.table,
                 )
+                loadable_batch = _jsonify_nested_columns(cast_batch)
                 buffer = io.BytesIO()
-                pq.write_table(pa.Table.from_batches([cast_batch]), buffer)
+                pq.write_table(pa.Table.from_batches([loadable_batch]), buffer)
             except (pa.ArrowException, ValueError, TypeError) as exc:
                 if isinstance(exc, pa.ArrowMemoryError):
                     # Transient memory pressure, not a deterministic
                     # input defect - leave it retryable.
                     raise
                 # Deterministic client-side failure: a malformed
-                # project/dataset/table id, or an Arrow type Parquet
-                # cannot store. pyarrow's ArrowNotImplementedError
-                # subclasses NotImplementedError - not a PEP-249 fatal
-                # name - so without this wrap it would ack RETRYABLE and
-                # the batch would retry forever.
+                # project/dataset/table id, an Arrow type Parquet cannot
+                # store, or a nested value JSON cannot represent.
+                # pyarrow's ArrowNotImplementedError subclasses
+                # NotImplementedError - not a PEP-249 fatal name - so
+                # without this wrap it would ack RETRYABLE and the batch
+                # would retry forever.
                 raise AdbcConfigurationError(
                     f"{type(exc).__name__}: BigQuery load job for "
                     f"{address} failed before upload (building the table "
-                    f"reference / serializing the batch to Parquet): {exc}"
+                    "reference / JSON-serializing nested columns / "
+                    f"serializing the batch to Parquet): {exc}"
                 ) from exc
             location = self._bq_dataset_location_sync(client, destination)
             job_id_prefix = self._load_job_id_prefix(
