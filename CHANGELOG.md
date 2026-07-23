@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.1] - 2026-07-23
+
+### Fixed
+- fix: deterministic load-job ids — polling-timeout retries attach instead of re-submitting (#9)
+
 ## [1.0.0] - 2026-07-23
 
 ### Changed
