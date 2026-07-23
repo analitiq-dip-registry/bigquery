@@ -128,7 +128,15 @@ _RETRYABLE_HTTP_CODES = frozenset({408, 429})
 #: most: BigQuery maps rateLimitExceeded / quotaExceeded to HTTP 403,
 #: which a bare 4xx rule would misread as a deterministic config defect.
 _RETRYABLE_GOOGLE_REASONS = frozenset(
-    {"rateLimitExceeded", "quotaExceeded", "backendError", "internalError"}
+    {
+        "rateLimitExceeded",
+        "quotaExceeded",
+        "backendError",
+        "internalError",
+        # Google's error table says retry-with-backoff for this one too,
+        # even though the client library maps it to HTTP 400.
+        "tableUnavailable",
+    }
 )
 #: RFC 6749 token-endpoint error codes that cannot heal between retries
 #: (revoked/expired grant, bad client credentials, malformed request).
@@ -590,6 +598,10 @@ class BigQueryConnector(GenericSQLConnector):
                 buffer = io.BytesIO()
                 pq.write_table(pa.Table.from_batches([cast_batch]), buffer)
             except (pa.ArrowException, ValueError, TypeError) as exc:
+                if isinstance(exc, pa.ArrowMemoryError):
+                    # Transient memory pressure, not a deterministic
+                    # input defect - leave it retryable.
+                    raise
                 # Deterministic client-side failure: a malformed
                 # project/dataset/table id, or an Arrow type Parquet
                 # cannot store. pyarrow's ArrowNotImplementedError
@@ -638,9 +650,11 @@ class BigQueryConnector(GenericSQLConnector):
         then the service-account key's embedded project. The billing
         project (the ``bigquery.Client``'s ``project``) is the
         connection's ``billing_project_id``, else the data project - the
-        driver exposes no readable quota_project option, so billing has NO
-        driver-side fallback. ``location`` falls back to the driver's
-        location option. Called only under ``_adbc_op_lock``.
+        driver's ``quota_project`` option IS readable via ``GetOption``,
+        but the parameters path is the same source that materialized it,
+        so the connector deliberately does not read it back. ``location``
+        falls back to the driver's location option. Called only under
+        ``_adbc_op_lock``.
         """
         if self._bq_client is not None:
             return self._bq_client
@@ -754,9 +768,21 @@ class BigQueryConnector(GenericSQLConnector):
                 ) from exc
             from google.oauth2 import service_account
 
-            credentials = service_account.Credentials.from_service_account_info(
-                info, scopes=[_BIGQUERY_SCOPE]
-            )
+            try:
+                credentials = (
+                    service_account.Credentials.from_service_account_info(
+                        info, scopes=[_BIGQUERY_SCOPE]
+                    )
+                )
+            except (ValueError, TypeError) as exc:
+                # google-auth raises MalformedError (a GoogleAuthError) for
+                # missing fields, but the cryptography layer raises a plain
+                # ValueError for undeserializable private_key material -
+                # deterministic bad input that must not ack RETRYABLE.
+                raise AdbcConfigurationError(
+                    "auth_json_credential could not be loaded as a "
+                    f"service-account key: {exc}"
+                ) from exc
             return credentials, str(info.get("project_id") or "")
         if auth_type.endswith("user_authentication"):
             options = {
