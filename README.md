@@ -47,7 +47,6 @@ BigQuery does **not** use a username and password and does **not** support API k
 
 - **`service` (default)** — paste the full contents of a service-account JSON key into the **Service Account JSON Key** field. This is the recommended path for automated pipelines.
 - **`user`** — supply an OAuth **client ID**, **client secret**, and **refresh token**.
-- **`aad`** — supply a Microsoft Entra ID **access token** (and optionally an audience URI).
 
 All traffic goes to `googleapis.com` over TLS, which is always on.
 
@@ -67,14 +66,14 @@ This is a database connector — it does not ship a fixed list of endpoints. Ins
 
 | Resource | How it's discovered | Description |
 |----------|---------------------|-------------|
-| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map.json`. |
+| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map-read.json` (write direction: `definition/type-map-write.json`). |
 
 ## Limitations
 
 - **No TCP port** — BigQuery is an HTTPS REST API; there is no host or port to configure.
 - **Quotas & limits** — BigQuery enforces per-project quotas (concurrent queries, query length, API request rates, response size). Concrete values vary by project and edition; see the [BigQuery quotas documentation](https://cloud.google.com/bigquery/quotas).
 - **Type mapping** — `BIGNUMERIC` maps to `Decimal256`; `GEOGRAPHY` and `INTERVAL` are surfaced as text (`Utf8`); `ARRAY`, `STRUCT`, and `RANGE` are surfaced as `Json`.
-- **Default dataset** — `dataset_id` scopes discovery but is not passed as an ADBC driver option.
+- **Default dataset** — `dataset_id` scopes discovery and is passed to the driver as `adbc.bigquery.sql.dataset_id`.
 
 ## For AI agents
 

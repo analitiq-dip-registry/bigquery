@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analitiq-connector-bigquery"
+version = "0.1.0"
+description = "Analitiq connector for Google BigQuery: dialect, driver, definition."
+requires-python = ">=3.11"
+# Driver dependencies live in requirements.txt (single source of truth);
+# the CDK itself is provided by the engine environment.
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# The repo root IS the package: connector.py + __init__.py at the top level,
+# per the documented connector layout.
+[tool.setuptools]
+packages = ["analitiq_connector_bigquery"]
+package-dir = { "analitiq_connector_bigquery" = "." }
+
+# Entry-point name is the connector slug (== connector_id == repo name); the
+# engine registry resolves (kind, slug) and these win over the generic kind
+# default. Both roles are registered: read and write are first-class.
+[project.entry-points."analitiq.source_connectors"]
+bigquery = "analitiq_connector_bigquery.connector:BigQueryConnector"
+
+[project.entry-points."analitiq.destination_connectors"]
+bigquery = "analitiq_connector_bigquery.connector:BigQueryConnector"

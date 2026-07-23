@@ -1,0 +1,15 @@
+# THIS connector's own driver + dialect packages (the engine pins no database
+# drivers). The ADBC BigQuery driver exchanges Arrow buffers natively via the
+# Storage Write API; adbc-driver-manager is the shared ADBC runtime.
+adbc-driver-bigquery>=1.1.0
+adbc-driver-manager>=1.1.0
+
+# sqlalchemy-bigquery registers the "bigquery" SQLAlchemy dialect. The data /
+# write transport is ADBC, but the engine's shared read path
+# (GenericSQLConnector -> QueryBuilder) borrows SQLAlchemy Core's compiler to
+# render paged SELECTs and resolves this dialect via
+# sqlalchemy.dialects.registry.load("bigquery"). "bigquery" is not a SQLAlchemy
+# built-in, so without this package every source read raises ImportError before
+# the first page. Floor is a release with SQLAlchemy 2.0 support (the engine CDK
+# pins sqlalchemy>=2.0,<3).
+sqlalchemy-bigquery>=1.9.0
