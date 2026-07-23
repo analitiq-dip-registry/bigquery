@@ -28,6 +28,13 @@ cast Arrow batch as an in-memory Parquet buffer submitted as a BigQuery
   was materialized with, via ``GetOption`` on the live ADBC database handle
   (service-account JSON for ``auth_type=service``; client id/secret/refresh
   token for ``auth_type=user``). No second credential input exists.
+* **Load-job type limits** - Json-family canonicals (``Json``, ``Object``,
+  the nested ``List``/``Struct``/``Map`` forms) render ``STRING`` DDL: the
+  CDK ships ``Json`` values as Parquet ``STRING``, and BigQuery batch load
+  jobs cannot populate ``JSON`` columns from Parquet. ``Duration`` and
+  ``Interval`` canonicals are rejected at CREATE TABLE time
+  (``render_column_type``): BigQuery INTERVAL cannot be populated by a
+  Parquet load job at all.
 
 Everything else BigQuery-specific lives here:
 
@@ -45,9 +52,9 @@ Everything else BigQuery-specific lives here:
   ``INFORMATION_SCHEMA.SCHEMATA`` is project-scoped (composed from the
   catalog alone) and region-scoped through the query job's location - set
   the ``location`` connection parameter for non-US datasets.
-* **NUMERIC/BIGNUMERIC render arithmetic** - the single write-direction
-  logic ``type-map-write.json`` cannot express. NUMERIC (precision <= 38,
-  scale <= 9, integer digits ``precision - scale`` <= 29) vs BIGNUMERIC
+* **NUMERIC/BIGNUMERIC render arithmetic** - write-direction logic
+  ``type-map-write.json`` cannot express. NUMERIC (precision <= 38, scale
+  <= 9, integer digits ``precision - scale`` <= 29) vs BIGNUMERIC
   (precision <= 76, scale <= 38, integer digits ``precision - scale`` <=
   38) is chosen from BOTH a Decimal's precision and scale, so a plain regex
   rule would emit an out-of-range ``NUMERIC(30, 15)``. Everything else
@@ -55,7 +62,7 @@ Everything else BigQuery-specific lives here:
 
 The read path still compiles paged ``SELECT``s through SQLAlchemy Core and
 resolves this dialect by name via
-``sqlalchemy.dialects.registry.load(\"bigquery\")``, so ``sqlalchemy-bigquery``
+``sqlalchemy.dialects.registry.load('bigquery')``, so ``sqlalchemy-bigquery``
 is a required runtime dependency (see ``requirements.txt``) even though the
 data transport is ADBC.
 
@@ -70,6 +77,7 @@ import io
 import json
 import logging
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -81,7 +89,7 @@ from cdk.sql.generic import GenericSQLConnector
 from cdk.type_map import normalize_canonical_type
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable
     from typing import Any
 
     from cdk.sql.dialects import TableAddress
@@ -112,16 +120,47 @@ _OPT_LOCATION = "adbc.bigquery.sql.location"
 _FATAL_DBAPI_ERROR_NAMES = frozenset(
     {"ProgrammingError", "NotSupportedError", "IntegrityError", "DataError"}
 )
-#: HTTP status codes on Google API call errors that CAN heal between retries.
+#: HTTP status codes on Google API call errors that CAN heal between
+#: retries. Consulted only after the reason-based classification.
 _RETRYABLE_HTTP_CODES = frozenset({408, 429})
+#: Google API error ``reason`` codes that are transient per BigQuery's
+#: error-table guidance (retry with backoff). The throttling pair matters
+#: most: BigQuery maps rateLimitExceeded / quotaExceeded to HTTP 403,
+#: which a bare 4xx rule would misread as a deterministic config defect.
+_RETRYABLE_GOOGLE_REASONS = frozenset(
+    {"rateLimitExceeded", "quotaExceeded", "backendError", "internalError"}
+)
+#: RFC 6749 token-endpoint error codes that cannot heal between retries
+#: (revoked/expired grant, bad client credentials, malformed request).
+#: A RefreshError naming anything else stays retryable.
+_DETERMINISTIC_OAUTH_ERRORS = frozenset(
+    {
+        "access_denied",
+        "invalid_client",
+        "invalid_grant",
+        "invalid_request",
+        "invalid_scope",
+        "unauthorized_client",
+        "unsupported_grant_type",
+    }
+)
 
 
 def _close_cursor_quietly(cursor: Any) -> None:
-    """Close an ADBC cursor, downgrading a close failure to a debug log."""
+    """Close an ADBC cursor best-effort, never masking a live error.
+
+    Local copy of the base's private ``_adbc_utils`` helper, kept at
+    WARNING parity with it: the swallowed close failure is a potential
+    server-side resource leak (BigQuery session, gRPC context) an operator
+    may need to act on, so it must not hide at DEBUG.
+    """
     try:
         cursor.close()
     except Exception:
-        logger.debug("ADBC cursor close failed", exc_info=True)
+        logger.warning(
+            "ADBC cursor close failed -- potential server-side resource leak",
+            exc_info=True,
+        )
 
 
 def _is_fatal_dbapi_error(exc: BaseException) -> bool:
@@ -140,8 +179,9 @@ class BigQueryDialect(SqlDialect):
     """BigQuery SQL strategy: backtick quoting, three-level (project ->
     dataset -> table) addressing, NOT ENFORCED primary keys, dataset-scoped
     INFORMATION_SCHEMA composition, the ``CREATE TABLE ... LIKE`` stage
-    clone for the MERGE upsert, and the NUMERIC/BIGNUMERIC precision-range
-    render override."""
+    clone for the MERGE upsert, and load-job-aware type rendering (the
+    NUMERIC/BIGNUMERIC precision-range choice; Duration/Interval
+    rejection)."""
 
     name = "bigquery"
     #: BigQuery reads double quotes as string literals; identifiers use backticks.
@@ -161,10 +201,15 @@ class BigQueryDialect(SqlDialect):
     supports_upsert_adbc = True
 
     #: Decimal128/Decimal256 canonical (post-``normalize_canonical_type``
-    #: form; the tolerant ``\\s*`` padding is defense in depth).
+    #: form; the tolerant whitespace padding is defense in depth).
     _DECIMAL_RE = re.compile(
         r"^Decimal(?:128|256)\(\s*(?P<p>\d+)\s*,\s*(?P<s>\d+)\s*\)$"
     )
+    #: Canonical families with no loadable BigQuery representation on the
+    #: Parquet load-job write path. ``render_column_type`` rejects them at
+    #: CREATE TABLE time; they are deliberately absent from
+    #: type-map-write.json (a takeover, not a coverage gap).
+    _UNLOADABLE_TEMPORAL_RE = re.compile(r"^(?P<family>Duration|Interval)\b")
 
     # ---- discovery: dataset-scoped INFORMATION_SCHEMA ----------------------
     def information_schema_ref(
@@ -222,20 +267,54 @@ class BigQueryDialect(SqlDialect):
     ) -> str:
         """Render a canonical Arrow type to BigQuery DDL.
 
-        Only the Decimal family needs code: NUMERIC vs BIGNUMERIC is chosen
-        from BOTH precision and scale - including each type's integer-digit
-        bound (``precision - scale``) - which the declarative write map
-        cannot express. The canonical is normalized first
-        (``normalize_canonical_type``) so every spelling the base mapper
-        would accept takes this same path instead of bypassing it. An
-        invalid decimal shape (precision < 1, or scale > precision - both
-        reachable cross-source; PostgreSQL 15+ allows declared scale >
-        precision) and a Decimal that fits neither native range fail loud
-        at render time rather than emitting invalid DDL. Every other
-        canonical delegates to ``type-map-write.json`` through the base
-        implementation.
+        Two families need code - both because the write path is a Parquet
+        load job, which the declarative write map cannot reason about:
+
+        * **Decimal128/Decimal256**: NUMERIC vs BIGNUMERIC is chosen from
+          BOTH precision and scale - including each type's integer-digit
+          bound (``precision - scale``) - so a plain regex rule would emit
+          an out-of-range ``NUMERIC(30, 15)``. An invalid decimal shape
+          (precision < 1, or scale > precision - both reachable
+          cross-source; PostgreSQL 15+ allows declared scale > precision)
+          and a Decimal that fits neither native range fail loud at render
+          time rather than emitting invalid DDL.
+        * **Duration/Interval**: rejected outright. BigQuery INTERVAL
+          columns cannot be populated by a Parquet load job - Arrow
+          interval values have no Parquet encoding (the Parquet writer
+          itself raises), and Arrow duration serializes to Parquet INT64,
+          which BigQuery refuses to load into INTERVAL. Rendering INTERVAL
+          DDL anyway would create a table whose loads can never succeed,
+          so this fails at CREATE TABLE time - deterministic, before the
+          table exists - with a message naming the upstream fix.
+
+        The canonical is normalized first (``normalize_canonical_type``)
+        so every spelling the base mapper would accept takes these same
+        paths instead of bypassing them. Every other canonical delegates
+        to ``type-map-write.json`` through the base implementation.
         """
-        match = self._DECIMAL_RE.match(normalize_canonical_type(canonical))
+        normalized = normalize_canonical_type(canonical)
+        unloadable = self._UNLOADABLE_TEMPORAL_RE.match(normalized)
+        if unloadable is not None:
+            if unloadable.group("family") == "Interval":
+                detail = (
+                    "Arrow interval values have no Parquet encoding "
+                    "(pyarrow's Parquet writer raises on "
+                    "month_day_nano_interval)"
+                )
+            else:
+                detail = (
+                    "Arrow duration serializes to Parquet INT64, which "
+                    "BigQuery refuses to load into an INTERVAL column"
+                )
+            raise ValueError(
+                f"{self.name}: canonical type {canonical!r} has no loadable "
+                f"BigQuery representation on the Parquet load-job write "
+                f"path ({detail}); failing at CREATE TABLE time, before an "
+                "unloadable table exists. Cast the source column upstream "
+                "- e.g. to Utf8 (ISO-8601 text) or, for Duration, Int64 "
+                "(a raw count in the declared unit)"
+            )
+        match = self._DECIMAL_RE.match(normalized)
         if match is not None:
             precision = int(match.group("p"))
             scale = int(match.group("s"))
@@ -275,9 +354,13 @@ class BigQueryConnector(GenericSQLConnector):
         super().__init__()
         # Lazily-built google-cloud-bigquery client for the load-job write
         # path. Built and used only under the base's _adbc_op_lock (all
-        # write entry points hold it), so no extra lock is needed. Dropped
-        # on any load failure so the next attempt rebuilds it from the live
-        # connection state; closed on disconnect.
+        # write entry points hold it). disconnect() also swaps it out
+        # WITHOUT the lock: that is safe only because the engine lifecycle
+        # never overlaps disconnect with an in-flight write_batch (writes
+        # drain before teardown) - stated explicitly because nothing in
+        # this class enforces it. Dropped on any load failure so the next
+        # attempt rebuilds it from the live connection state; closed on
+        # disconnect.
         self._bq_client: bigquery.Client | None = None
         # Data project (dataset owner) resolved alongside the client: the
         # connection's project_id, else the driver's, else the
@@ -296,9 +379,11 @@ class BigQueryConnector(GenericSQLConnector):
         Overrides the base's ``cursor.adbc_ingest`` append (the BigQuery
         ADBC driver rejects every ``adbc.ingest.*`` statement option, and
         DML INSERT writes are quota-bound and costly). Serves keyed
-        insert, and truncate-insert's append phase via the base's
-        ``_truncate_then_ingest_sync`` (the TRUNCATE itself still runs as
-        SQL over the ADBC connection). The lock acquire mirrors the base:
+        insert and truncate-insert appends: only the FIRST
+        truncate-insert batch routes through the base's
+        ``_truncate_then_ingest_sync`` (TRUNCATE as SQL over the ADBC
+        connection, then this method); every subsequent batch of the
+        stream calls here directly. The lock acquire mirrors the base:
         ``_adbc_op_lock`` is reentrant for the truncate-then-ingest
         composition.
         """
@@ -397,8 +482,10 @@ class BigQueryConnector(GenericSQLConnector):
                     _close_cursor_quietly(drop_cursor)
             except Exception:
                 logger.warning(
-                    "BigQuery stage table %s left behind after MERGE failure; "
-                    "the next retry's pre-flight DROP IF EXISTS will clean it up",
+                    "BigQuery stage table %s left behind after MERGE "
+                    "failure; a retryable failure is cleaned up by the next "
+                    "attempt's pre-flight DROP IF EXISTS, but after a FATAL "
+                    "failure the table must be dropped manually",
                     stage_qualified,
                     exc_info=True,
                 )
@@ -408,23 +495,43 @@ class BigQueryConnector(GenericSQLConnector):
             if _is_fatal_dbapi_error(exc):
                 raise _as_fatal(exc) from exc
             raise
-        # Success path - DROP the stage so subsequent writes start clean. A
-        # failed DROP is cleaned up by the next retry's pre-flight
-        # DROP IF EXISTS, so idempotency survives even a persistent failure.
-        try:
-            drop_cursor = conn.cursor()
+        # Success path - DROP the stage so it does not outlive the batch.
+        # The stage name embeds this batch's sequence number and the batch
+        # is acked right after this method returns, so nothing ever
+        # retries it: the pre-flight DROP IF EXISTS only serves retries of
+        # FAILED batches and will never reach this table. Try twice, then
+        # log honestly that the table is orphaned.
+        dropped = False
+        for attempt in (1, 2):
             try:
-                drop_cursor.execute(f"DROP TABLE IF EXISTS {stage_qualified}")
-                conn.commit()
-            finally:
-                _close_cursor_quietly(drop_cursor)
-        except Exception:
+                drop_cursor = conn.cursor()
+                try:
+                    drop_cursor.execute(
+                        f"DROP TABLE IF EXISTS {stage_qualified}"
+                    )
+                    conn.commit()
+                    dropped = True
+                finally:
+                    _close_cursor_quietly(drop_cursor)
+            except Exception:
+                logger.debug(
+                    "post-MERGE DROP of BigQuery stage table %s failed "
+                    "(attempt %d/2)",
+                    stage_qualified,
+                    attempt,
+                    exc_info=True,
+                )
+            if dropped:
+                break
+        if not dropped:
             logger.warning(
-                "BigQuery stage table %s post-MERGE DROP failed; the next "
-                "retry of this batch will clean it up via pre-flight "
-                "DROP IF EXISTS",
+                "BigQuery stage table %s could not be dropped after a "
+                "successful MERGE (two attempts; tracebacks at DEBUG). The "
+                "batch is acked and never retried, so no automatic cleanup "
+                "reaches this table: it is orphaned - a full copy of this "
+                "batch - until dropped manually or expired by the "
+                "dataset's default table expiration",
                 stage_qualified,
-                exc_info=True,
             )
 
     # ---- load-job machinery -------------------------------------------------
@@ -438,16 +545,31 @@ class BigQueryConnector(GenericSQLConnector):
 
         Called under ``_adbc_op_lock``. The batch is written to an
         in-memory Parquet buffer and shipped as a direct media upload -
-        no GCS staging bucket, no new connection inputs. Deterministic
-        failures (Google API 4xx other than 408/429, credential errors)
-        raise ``AdbcConfigurationError`` so the engine fails the batch
-        fatally instead of retrying forever; transient failures re-raise
-        unchanged and stay retryable. Any failure drops the cached client
-        so the next attempt rebuilds it from the live connection state.
+        no GCS staging bucket, no new connection inputs.
+
+        Failure classification (the base ``write_batch`` acks RETRYABLE
+        for anything not ``AdbcConfigurationError``-shaped, and retries
+        have no cap):
+
+        * Building the table reference and serializing the batch to
+          Parquet involve no network - any failure there is deterministic
+          against the same batch and wraps in ``AdbcConfigurationError``.
+        * Google API errors classify by error *reason* first (BigQuery's
+          403-mapped throttling retries with backoff), then by HTTP
+          status; credential errors distinguish transport/transient
+          refresh failures (retryable) from bad credential material
+          (fatal). See ``_is_deterministic_google_error``.
+
+        Any failure drops the cached client so the next attempt rebuilds
+        it from the live connection state.
         """
         from google.cloud import bigquery
 
         if not address.schema:
+            # Defense in depth: the base already rejects schema-less ADBC
+            # destinations at configure_schema time (_destination_address
+            # returns None before DDL), so the normal lifecycle cannot
+            # reach this raise.
             raise AdbcConfigurationError(
                 f"BigQuery load job for {address} has no dataset; ADBC "
                 "destinations require database_object.schema (the dataset) "
@@ -455,15 +577,30 @@ class BigQueryConnector(GenericSQLConnector):
             )
         try:
             client = self._bigquery_client_sync(conn)
-            destination = bigquery.TableReference(
-                bigquery.DatasetReference(
-                    address.catalog or self._bq_data_project or client.project,
-                    address.schema,
-                ),
-                address.table,
-            )
-            buffer = io.BytesIO()
-            pq.write_table(pa.Table.from_batches([cast_batch]), buffer)
+            try:
+                destination = bigquery.TableReference(
+                    bigquery.DatasetReference(
+                        address.catalog
+                        or self._bq_data_project
+                        or client.project,
+                        address.schema,
+                    ),
+                    address.table,
+                )
+                buffer = io.BytesIO()
+                pq.write_table(pa.Table.from_batches([cast_batch]), buffer)
+            except (pa.ArrowException, ValueError, TypeError) as exc:
+                # Deterministic client-side failure: a malformed
+                # project/dataset/table id, or an Arrow type Parquet
+                # cannot store. pyarrow's ArrowNotImplementedError
+                # subclasses NotImplementedError - not a PEP-249 fatal
+                # name - so without this wrap it would ack RETRYABLE and
+                # the batch would retry forever.
+                raise AdbcConfigurationError(
+                    f"{type(exc).__name__}: BigQuery load job for "
+                    f"{address} failed before upload (building the table "
+                    f"reference / serializing the batch to Parquet): {exc}"
+                ) from exc
             buffer.seek(0)
             job_config = bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.PARQUET,
@@ -482,12 +619,10 @@ class BigQueryConnector(GenericSQLConnector):
         except Exception as exc:
             self._drop_bigquery_client_sync()
             if self._is_deterministic_google_error(exc):
-                wrapped = AdbcConfigurationError(
+                raise AdbcConfigurationError(
                     f"{type(exc).__name__}: BigQuery load job into "
                     f"{address} failed deterministically: {exc}"
-                )
-                wrapped.__cause__ = exc
-                raise wrapped from exc
+                ) from exc
             raise
 
     def _bigquery_client_sync(self, conn: Any) -> bigquery.Client:
@@ -497,13 +632,15 @@ class BigQueryConnector(GenericSQLConnector):
         was materialized with, read back from the live database handle via
         ``GetOption`` (``conn.adbc_database``): the service-account JSON
         for ``auth_type=service``, the client id/secret/refresh token for
-        ``auth_type=user``. Non-secret settings (project, billing project,
-        location) come from ``connection.parameters`` through the runtime's
-        public ``raw_config``, with the driver's own options as fallback.
-        The client's project is the billing project
-        (``billing_project_id``, else the data project) - the same split
-        the transport's ``adbc.bigquery.sql.auth.quota_project`` declares.
-        Called only under ``_adbc_op_lock``.
+        ``auth_type=user``. The data project comes from
+        ``connection.parameters`` through the runtime's public
+        ``raw_config``, falling back to the driver's project_id option and
+        then the service-account key's embedded project. The billing
+        project (the ``bigquery.Client``'s ``project``) is the
+        connection's ``billing_project_id``, else the data project - the
+        driver exposes no readable quota_project option, so billing has NO
+        driver-side fallback. ``location`` falls back to the driver's
+        location option. Called only under ``_adbc_op_lock``.
         """
         if self._bq_client is not None:
             return self._bq_client
@@ -512,14 +649,21 @@ class BigQueryConnector(GenericSQLConnector):
 
         database = conn.adbc_database
 
-        def opt(key: str) -> str:
+        def opt(key: str) -> str | None:
+            """Driver option via GetOption: '' = unset, None = call raised."""
             try:
                 return database.get_option(key) or ""
             except Exception:
-                # An unset/unknown option. GetOption itself ships with the
-                # adbc-driver-bigquery >= 1.11.0 floor; required options are
-                # re-checked (and fail loud) by the credential builder.
-                return ""
+                # Distinguishable from '' so the credential builder can
+                # point at the driver install (a pre-GetOption wheel)
+                # instead of misreporting a connection-config defect.
+                logger.debug(
+                    "GetOption(%r) raised on the ADBC BigQuery database "
+                    "handle; treating the option as unreadable",
+                    key,
+                    exc_info=True,
+                )
+                return None
 
         credentials, key_project = self._build_google_credentials(
             opt(_OPT_AUTH_TYPE), opt
@@ -552,7 +696,7 @@ class BigQueryConnector(GenericSQLConnector):
         return client
 
     def _build_google_credentials(
-        self, auth_type: str, opt: Callable[[str], str]
+        self, auth_type: str | None, opt: Callable[[str], str | None]
     ) -> tuple[Any, str]:
         """Build google-auth credentials from the driver's auth options.
 
@@ -561,14 +705,45 @@ class BigQueryConnector(GenericSQLConnector):
         The two accepted driver auth types are exactly the two the
         connection contract's ``auth_type`` enum can produce via the
         transport's lookup (``service`` / ``user``).
+
+        ``opt`` results are tri-state: a value, ``''`` (the option is
+        unset), or ``None`` (``GetOption`` itself raised - traceback at
+        DEBUG). The terminal errors keep the two failure directions
+        apart: ``None`` points at the driver install (a wheel predating
+        the >= 1.11.0 GetOption floor), ``''`` at the connection
+        configuration.
         """
+        if auth_type is None:
+            raise AdbcConfigurationError(
+                "BigQuery load jobs: reading auth_type back from the live "
+                "ADBC connection failed (GetOption raised; traceback at "
+                "DEBUG). The installed adbc-driver-bigquery most likely "
+                "predates the >= 1.11.0 floor that implements database "
+                "GetOption - fix the driver install, not the connection "
+                "configuration"
+            )
+        if not auth_type:
+            raise AdbcConfigurationError(
+                "BigQuery load jobs: the ADBC driver returned an empty "
+                "auth_type from the live connection - the connection's "
+                "auth_type parameter never reached the driver (transport "
+                "wiring defect, not an operator error)"
+            )
         if auth_type.endswith("json_credential_string"):
             raw = opt(_OPT_AUTH_CREDENTIALS)
+            if raw is None:
+                raise AdbcConfigurationError(
+                    "BigQuery load jobs: GetOption raised while reading "
+                    "auth_credentials back from the live ADBC connection "
+                    "(traceback at DEBUG); adbc-driver-bigquery >= 1.11.0 "
+                    "implements it - fix the driver install"
+                )
             if not raw:
                 raise AdbcConfigurationError(
                     "BigQuery load jobs: the ADBC driver returned no "
-                    "auth_credentials for auth_type=service "
-                    "(adbc-driver-bigquery >= 1.11.0 is required)"
+                    "auth_credentials for auth_type=service; the "
+                    "connection's auth_json_credential secret appears to be "
+                    "unset"
                 )
             try:
                 info = json.loads(raw)
@@ -584,23 +759,33 @@ class BigQueryConnector(GenericSQLConnector):
             )
             return credentials, str(info.get("project_id") or "")
         if auth_type.endswith("user_authentication"):
-            client_id = opt(_OPT_CLIENT_ID)
-            client_secret = opt(_OPT_CLIENT_SECRET)
-            refresh_token = opt(_OPT_REFRESH_TOKEN)
-            if not (client_id and client_secret and refresh_token):
+            options = {
+                "client_id": opt(_OPT_CLIENT_ID),
+                "client_secret": opt(_OPT_CLIENT_SECRET),
+                "refresh_token": opt(_OPT_REFRESH_TOKEN),
+            }
+            unreadable = sorted(k for k, v in options.items() if v is None)
+            if unreadable:
+                raise AdbcConfigurationError(
+                    "BigQuery load jobs: GetOption raised while reading "
+                    f"{', '.join(unreadable)} back from the live ADBC "
+                    "connection (traceback at DEBUG); adbc-driver-bigquery "
+                    ">= 1.11.0 implements it - fix the driver install"
+                )
+            missing = sorted(k for k, v in options.items() if not v)
+            if missing:
                 raise AdbcConfigurationError(
                     "BigQuery load jobs: auth_type=user requires client_id, "
-                    "client_secret, and refresh_token; the ADBC driver "
-                    "returned an incomplete set (adbc-driver-bigquery >= "
-                    "1.11.0 is required)"
+                    "client_secret, and refresh_token; the connection left "
+                    f"{', '.join(missing)} unset"
                 )
             from google.oauth2.credentials import Credentials as UserCredentials
 
             credentials = UserCredentials(
                 token=None,
-                refresh_token=refresh_token,
-                client_id=client_id,
-                client_secret=client_secret,
+                refresh_token=options["refresh_token"],
+                client_id=options["client_id"],
+                client_secret=options["client_secret"],
                 token_uri=_GOOGLE_TOKEN_URI,
                 scopes=[_BIGQUERY_SCOPE],
             )
@@ -611,20 +796,44 @@ class BigQueryConnector(GenericSQLConnector):
             "key) and auth_type=user (OAuth user credentials)"
         )
 
-    @staticmethod
-    def _is_deterministic_google_error(exc: BaseException) -> bool:
+    # ---- failure classification --------------------------------------------
+    @classmethod
+    def _is_deterministic_google_error(cls, exc: BaseException) -> bool:
         """True when a Google-side failure cannot heal between retries.
 
-        Credential/refresh failures and client-side (4xx) API errors other
-        than 408/429 are deterministic against an identical request; 5xx
-        and network errors stay retryable.
+        The base ``write_batch`` acks RETRYABLE for anything not
+        ``AdbcConfigurationError``-shaped, so this predicate decides
+        retry-with-backoff vs fail-fatal:
+
+        * ``TransportError`` (network trouble reaching Google's OAuth
+          endpoint) - never deterministic.
+        * ``RefreshError`` - deterministic only when it names a
+          deterministic OAuth error code (``invalid_grant`` etc.);
+          token-endpoint 5xx and unclassifiable refresh failures stay
+          retryable. Realistic under auth_type=user: the client is
+          dropped on every failure and refreshes on every rebuild.
+        * Other ``GoogleAuthError`` (malformed / missing credential
+          material) - deterministic.
+        * ``GoogleAPICallError`` - classified by error *reason* first:
+          BigQuery maps throttling (rateLimitExceeded / quotaExceeded) to
+          HTTP 403, which a bare 4xx rule would misread as a config
+          defect; Google's guidance for those is retry with backoff.
+          Unambiguously deterministic reasons (accessDenied, invalid,
+          notFound, duplicate) carry non-408/429 4xx codes and fall
+          through to the status rule. 5xx stays retryable.
         """
         from google.api_core import exceptions as api_exceptions
         from google.auth import exceptions as auth_exceptions
 
+        if isinstance(exc, auth_exceptions.TransportError):
+            return False
+        if isinstance(exc, auth_exceptions.RefreshError):
+            return cls._is_deterministic_refresh_error(exc)
         if isinstance(exc, auth_exceptions.GoogleAuthError):
             return True
         if isinstance(exc, api_exceptions.GoogleAPICallError):
+            if cls._google_error_reasons(exc) & _RETRYABLE_GOOGLE_REASONS:
+                return False
             code = getattr(exc, "code", None)
             return (
                 isinstance(code, int)
@@ -632,6 +841,46 @@ class BigQueryConnector(GenericSQLConnector):
                 and code not in _RETRYABLE_HTTP_CODES
             )
         return False
+
+    @staticmethod
+    def _google_error_reasons(exc: BaseException) -> frozenset[str]:
+        """Collect the per-error ``reason`` codes off a Google API error.
+
+        google-cloud-bigquery surfaces the job/API error list as
+        ``exc.errors`` - a list of dicts with ``reason`` / ``message``
+        keys. Absent or unparseable entries yield the empty set, which
+        falls back to status-code classification.
+        """
+        reasons: set[str] = set()
+        for err in getattr(exc, "errors", None) or ():
+            if isinstance(err, Mapping):
+                reason = err.get("reason")
+                if reason:
+                    reasons.add(str(reason))
+        return frozenset(reasons)
+
+    @staticmethod
+    def _is_deterministic_refresh_error(exc: BaseException) -> bool:
+        """True when a RefreshError names a deterministic OAuth error.
+
+        google-auth marks transient refresh failures (token-endpoint 5xx,
+        ``server_error`` / ``temporarily_unavailable``) with
+        ``retryable=True`` - honor that first. Otherwise look for a
+        deterministic RFC 6749 error code in the response payload (a
+        Mapping in ``args``) or the message text. A refresh failure with
+        no recognizable code stays retryable: a few wasted retries on a
+        dead credential cost far less than fatally failing a healthy
+        stream on a transient wobble.
+        """
+        if getattr(exc, "retryable", False):
+            return False
+        for arg in exc.args:
+            if isinstance(arg, Mapping):
+                code = str(arg.get("error") or "")
+                if code:
+                    return code in _DETERMINISTIC_OAUTH_ERRORS
+        text = str(exc)
+        return any(code in text for code in _DETERMINISTIC_OAUTH_ERRORS)
 
     def _drop_bigquery_client_sync(self) -> None:
         """Drop (and close) the cached load-job client after a failure.
@@ -647,15 +896,31 @@ class BigQueryConnector(GenericSQLConnector):
                 logger.debug("BigQuery client close failed", exc_info=True)
 
     async def disconnect(self) -> None:
-        """Close the load-job client, then run the base ADBC disconnect."""
+        """Close the load-job client, then run the base ADBC disconnect.
+
+        Mirrors the base's cancellation shape: a ``CancelledError`` during
+        the client close is remembered - never allowed to skip
+        ``super().disconnect()``, which releases the ADBC connection and
+        the runtime - and re-raised after the base teardown so the
+        caller's cancellation is honored.
+        """
+        cancelled: BaseException | None = None
         client = self._bq_client
         self._bq_client = None
         if client is not None:
             try:
                 await asyncio.to_thread(client.close)
+            except asyncio.CancelledError as exc:
+                logger.error(
+                    "BigQuery load-job client close cancelled during "
+                    "disconnect; its HTTP session may leak"
+                )
+                cancelled = exc
             except Exception:
                 logger.warning(
                     "BigQuery load-job client close failed during disconnect",
                     exc_info=True,
                 )
         await super().disconnect()
+        if cancelled is not None:
+            raise cancelled

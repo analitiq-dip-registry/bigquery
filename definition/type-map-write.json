@@ -17,15 +17,13 @@
   {"match": "exact", "canonical": "LargeBinary", "native": "BYTES"},
   {"match": "exact", "canonical": "Date32", "native": "DATE"},
   {"match": "exact", "canonical": "Date64", "native": "DATE"},
-  {"match": "exact", "canonical": "Json", "native": "JSON"},
-  {"match": "exact", "canonical": "Object", "native": "JSON"},
+  {"match": "exact", "canonical": "Json", "native": "STRING"},
+  {"match": "exact", "canonical": "Object", "native": "STRING"},
   {"match": "regex", "canonical": "^FixedSizeBinary\\(\\d+\\)$", "native": "BYTES"},
   {"match": "regex", "canonical": "^Time(32|64)\\(.*\\)$", "native": "TIME"},
-  {"match": "regex", "canonical": "^Duration\\(.*\\)$", "native": "INTERVAL"},
-  {"match": "regex", "canonical": "^Interval\\(.*\\)$", "native": "INTERVAL"},
   {"match": "regex", "canonical": "^Timestamp\\([^,)]+,[^)]+\\)$", "native": "TIMESTAMP"},
   {"match": "regex", "canonical": "^Timestamp\\([^,)]+\\)$", "native": "DATETIME"},
-  {"match": "regex", "canonical": "^(List|LargeList|FixedSizeList)<.*>$", "native": "JSON"},
-  {"match": "regex", "canonical": "^Struct<.*>$", "native": "JSON"},
-  {"match": "regex", "canonical": "^Map<.*>$", "native": "JSON"}
+  {"match": "regex", "canonical": "^(List|LargeList|FixedSizeList)<.*>$", "native": "STRING"},
+  {"match": "regex", "canonical": "^Struct<.*>$", "native": "STRING"},
+  {"match": "regex", "canonical": "^Map<.*>$", "native": "STRING"}
 ]

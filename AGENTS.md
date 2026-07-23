@@ -46,6 +46,7 @@ The BigQuery ADBC driver implements no `adbc.ingest.*` bulk path, and DML `INSER
 - **Append / truncate-insert** — each Arrow batch is written to an in-memory Parquet buffer and submitted as a `WRITE_APPEND` load job (direct media upload; no GCS staging bucket, no extra inputs).
 - **Upsert / keyless-insert dedup** — **supported**: the batch loads into a stage table cloned with `CREATE TABLE … LIKE`, then `MERGE`s into the target on the declared conflict keys. BigQuery's `NOT ENFORCED` primary keys are sufficient — the `MERGE` needs only the `ON` clause.
 - **Credentials** — rebuilt from the same connection state (service-account key or OAuth user credentials), read back from the live ADBC connection; no second credential input exists.
+- **Failure classification** — load-job failures are classified by BigQuery error reason: `rateLimitExceeded`/`quotaExceeded` (HTTP 403), `backendError`, and `internalError` are retried with backoff; `accessDenied`, `invalid`, `notFound`, and `duplicate` fail the batch as deterministic. OAuth credential-refresh failures are retried unless the token endpoint names a deterministic error such as `invalid_grant` or `invalid_client`.
 
 ## Rate Limits
 
@@ -53,7 +54,7 @@ BigQuery enforces quotas and limits (concurrent interactive queries, query lengt
 
 ## Type Mapping
 
-Read direction (native → Arrow) is defined in `definition/type-map-read.json`; write direction (Arrow → native DDL) in `definition/type-map-write.json`. Scale-omitted decimal declarations (`NUMERIC(10)`) map with scale 0. The `NUMERIC`/`BIGNUMERIC` write render is handled by `BigQueryDialect.render_column_type` in `connector.py` (not the write map), because the NUMERIC-vs-BIGNUMERIC choice depends on precision, scale, **and** each type's integer-digit bound; invalid decimal shapes (precision < 1, scale > precision, or out of BIGNUMERIC range) fail loud at render time.
+Read direction (native → Arrow) is defined in `definition/type-map-read.json`; write direction (Arrow → native DDL) in `definition/type-map-write.json`. Scale-omitted decimal declarations (`NUMERIC(10)`) map with scale 0. The `NUMERIC`/`BIGNUMERIC` write render is handled by `BigQueryDialect.render_column_type` in `connector.py` (not the write map), because the NUMERIC-vs-BIGNUMERIC choice depends on precision, scale, **and** each type's integer-digit bound; invalid decimal shapes (precision < 1, scale > precision, or out of BIGNUMERIC range) fail loud at render time. `Duration`/`Interval` are deliberately unmapped in the write map — `render_column_type` takes over both families and rejects them with an actionable error (see Caveats).
 
 ## Caveats
 
@@ -63,5 +64,6 @@ Read direction (native → Arrow) is defined in `definition/type-map-read.json`;
 - `BIGNUMERIC` maps to `Decimal256` (precision up to 76 exceeds `Decimal128`'s max of 38).
 - `GEOGRAPHY` and `INTERVAL` are surfaced as `Utf8` (WKT / ISO-8601 text); `ARRAY`, `STRUCT`, and `RANGE` map to `Json`.
 - Load jobs apply BigQuery column default value expressions for columns absent from the loaded Parquet file (engine-stamped metadata columns rely on this).
-- `Json`-canonical columns are loaded from Parquet `STRING` into BigQuery `JSON` columns.
-- `Duration`/`Interval`-typed source columns render `INTERVAL` DDL, but such columns are not representable in Parquet load jobs — loading one fails.
+- `Json`-family canonicals (`Json`, `Object`, and the nested `List`/`Struct`/`Map` forms) render `STRING` DDL, not `JSON`: the CDK ships `Json` values as Parquet `STRING`, and BigQuery batch load jobs cannot populate `JSON` columns from Parquet (JSON ingest via batch load requires CSV, newline-delimited JSON, or Avro source formats). The JSON text lands intact in the `STRING` column and is queryable in place via `PARSE_JSON()` and the JSON functions. A BigQuery-native `JSON` source column therefore round-trips to a `STRING` destination column.
+- `Duration`/`Interval`-typed source columns are rejected at `CREATE TABLE` time (`BigQueryDialect.render_column_type` raises; the two families are deliberately absent from `type-map-write.json`): BigQuery `INTERVAL` cannot be populated by a Parquet load job — Arrow interval values have no Parquet encoding at all, and Arrow duration serializes to Parquet `INT64`, which BigQuery refuses to load into `INTERVAL`. The stream fails loud at schema configuration, before an unloadable table exists; cast such columns upstream (e.g. to `Utf8`, or `Int64` for a raw duration count).
+- If the post-`MERGE` stage-table `DROP` fails on the success path (two attempts), the stage table is orphaned — the batch is acked and never retried — and must be dropped manually or expire via the dataset's default table expiration; a WARNING log names the table.
