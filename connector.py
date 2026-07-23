@@ -766,6 +766,14 @@ class BigQueryConnector(GenericSQLConnector):
                     "auth_json_credential is not valid JSON (expected the "
                     "full service-account key file contents)"
                 ) from exc
+            if not isinstance(info, dict):
+                # A JSON array/string/number parses fine but would raise
+                # AttributeError inside google-auth - which is not in the
+                # deterministic wrap and would ack RETRYABLE forever.
+                raise AdbcConfigurationError(
+                    "auth_json_credential is not a JSON object (expected "
+                    "the full service-account key file contents)"
+                )
             from google.oauth2 import service_account
 
             try:
