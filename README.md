@@ -4,13 +4,13 @@
 [![Latest release](https://img.shields.io/github/v/release/analitiq-dip-registry/bigquery)](https://github.com/analitiq-dip-registry/bigquery/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-Read schemas, tables, and views from Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver.
+Read from and write to Google BigQuery — Google Cloud's serverless, highly scalable data warehouse — over the ADBC BigQuery driver (reads) and Parquet load jobs (writes).
 
 ## What is this?
 
 This is a **connector** — a configuration that defines how to authenticate with Google BigQuery and what data is available for reading and writing. It does not move data by itself. Instead, it is used by the [Analitiq](https://analitiq-app.com) data integration platform or the open-source `analitiq-dip-registry` engine to set up data pipelines.
 
-This is a **database** connector: it connects over the engine's ADBC BigQuery driver (`transport_type: adbc`, `driver: bigquery`) and discovers tables and column types at runtime from BigQuery's `INFORMATION_SCHEMA` — so there are no per-endpoint definition files.
+This is a **database** connector: it connects over the engine's ADBC BigQuery driver (`transport_type: adbc`, `driver: bigquery`) and discovers tables and column types at runtime from BigQuery's `INFORMATION_SCHEMA` — so there are no per-endpoint definition files. Writes follow the industry-standard load-job pattern: each batch ships as an in-memory Parquet buffer submitted as a BigQuery load job (no GCS staging bucket needed), with upserts staged and `MERGE`d on the declared keys.
 
 ## How to use this connector
 

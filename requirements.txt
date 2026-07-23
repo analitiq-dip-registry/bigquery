@@ -1,15 +1,33 @@
 # THIS connector's own driver + dialect packages (the engine pins no database
-# drivers). The ADBC BigQuery driver exchanges Arrow buffers natively via the
-# Storage Write API; adbc-driver-manager is the shared ADBC runtime.
-adbc-driver-bigquery>=1.1.0
-adbc-driver-manager>=1.1.0
+# drivers). The ADBC BigQuery driver serves connect, SQL execution, discovery,
+# and Arrow reads; adbc-driver-manager is the shared ADBC runtime.
+#
+# Floor 1.11.0: the connector relies on driver capabilities absent from older
+# wheels - the adbc.bigquery.sql.auth.quota_project database option declared
+# in connector.json db_kwargs (missing even from the 1.11.0 Python
+# DatabaseOptions enum; present in the 1.11.0 Go driver), and database
+# GetOption support, which the load-job write path uses to recover
+# credentials from the live connection. 1.11.0 is the verified vendored
+# driver build.
+adbc-driver-bigquery>=1.11.0
+adbc-driver-manager>=1.11.0
 
-# sqlalchemy-bigquery registers the "bigquery" SQLAlchemy dialect. The data /
-# write transport is ADBC, but the engine's shared read path
-# (GenericSQLConnector -> QueryBuilder) borrows SQLAlchemy Core's compiler to
-# render paged SELECTs and resolves this dialect via
-# sqlalchemy.dialects.registry.load("bigquery"). "bigquery" is not a SQLAlchemy
-# built-in, so without this package every source read raises ImportError before
-# the first page. Floor is a release with SQLAlchemy 2.0 support (the engine CDK
-# pins sqlalchemy>=2.0,<3).
+# sqlalchemy-bigquery registers the "bigquery" SQLAlchemy dialect. The data
+# transport is ADBC, but the engine's shared read path (GenericSQLConnector
+# -> QueryBuilder) borrows SQLAlchemy Core's compiler to render paged SELECTs
+# and resolves this dialect via sqlalchemy.dialects.registry.load("bigquery").
+# "bigquery" is not a SQLAlchemy built-in, so without this package every
+# source read raises ImportError before the first page. Floor is a release
+# with SQLAlchemy 2.0 support (the engine CDK pins sqlalchemy>=2.0,<3).
 sqlalchemy-bigquery>=1.9.0
+
+# google-cloud-bigquery runs the write path: the BigQuery ADBC driver
+# implements no adbc.ingest.* bulk path, so batches ship as Parquet load
+# jobs (load_table_from_file - direct media upload, no GCS staging bucket).
+# Credentials are rebuilt from the same connection state via google-auth,
+# which google-cloud-bigquery already depends on (no separate pin). pyarrow
+# is deliberately NOT listed: the CDK's arrow/streaming extra owns it and
+# cdk.sql.generic (this connector's base) hard-imports it, so it is
+# structurally present wherever this connector runs. Floor 3.14.0: mature
+# 3.x LoadJob/Parquet surface with Python 3.11/3.12 wheels.
+google-cloud-bigquery>=3.14.0

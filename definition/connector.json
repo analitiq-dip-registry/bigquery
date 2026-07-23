@@ -3,9 +3,16 @@
   "kind": "database",
   "connector_id": "bigquery",
   "display_name": "Google BigQuery",
-  "description": "Google BigQuery serverless data warehouse, accessed over the first-class ADBC BigQuery driver (Arrow-native Storage Write API). Authenticates with a service-account JSON key (default) or an OAuth user-credential flow; all connection state is passed via adbc.bigquery.sql.* driver options.",
+  "description": "Google BigQuery serverless data warehouse. Connects, discovers, and reads over the first-class ADBC BigQuery driver; writes land as Parquet load jobs via the BigQuery API (direct media upload, no GCS staging bucket). Authenticates with a service-account JSON key (default) or an OAuth user-credential flow; all connection state is passed via adbc.bigquery.sql.* driver options.",
   "documentation_url": "https://cloud.google.com/bigquery/docs",
-  "tags": ["database", "warehouse", "bigquery", "google", "gcp", "adbc"],
+  "tags": [
+    "database",
+    "warehouse",
+    "bigquery",
+    "google",
+    "gcp",
+    "adbc"
+  ],
   "version": "0.0.1",
   "default_transport": "database",
   "transports": {
@@ -13,22 +20,40 @@
       "transport_type": "adbc",
       "driver": "bigquery",
       "db_kwargs": {
-        "adbc.bigquery.sql.project_id": { "ref": "connection.parameters.project_id" },
-        "adbc.bigquery.sql.dataset_id": { "ref": "connection.parameters.dataset_id" },
-        "adbc.bigquery.sql.location": { "ref": "connection.parameters.location" },
-        "adbc.bigquery.sql.auth.quota_project": { "ref": "connection.parameters.billing_project_id" },
+        "adbc.bigquery.sql.project_id": {
+          "ref": "connection.parameters.project_id"
+        },
+        "adbc.bigquery.sql.dataset_id": {
+          "ref": "connection.parameters.dataset_id"
+        },
+        "adbc.bigquery.sql.location": {
+          "ref": "connection.parameters.location"
+        },
+        "adbc.bigquery.sql.auth.quota_project": {
+          "ref": "connection.parameters.billing_project_id"
+        },
         "adbc.bigquery.sql.auth_type": {
           "function": "lookup",
-          "input": { "ref": "connection.parameters.auth_type" },
+          "input": {
+            "ref": "connection.parameters.auth_type"
+          },
           "map": {
             "service": "adbc.bigquery.sql.auth_type.json_credential_string",
             "user": "adbc.bigquery.sql.auth_type.user_authentication"
           }
         },
-        "adbc.bigquery.sql.auth_credentials": { "ref": "secrets.auth_json_credential" },
-        "adbc.bigquery.sql.auth.client_id": { "ref": "connection.parameters.client_id" },
-        "adbc.bigquery.sql.auth.client_secret": { "ref": "secrets.client_secret" },
-        "adbc.bigquery.sql.auth.refresh_token": { "ref": "secrets.refresh_token" }
+        "adbc.bigquery.sql.auth_credentials": {
+          "ref": "secrets.auth_json_credential"
+        },
+        "adbc.bigquery.sql.auth.client_id": {
+          "ref": "connection.parameters.client_id"
+        },
+        "adbc.bigquery.sql.auth.client_secret": {
+          "ref": "secrets.client_secret"
+        },
+        "adbc.bigquery.sql.auth.refresh_token": {
+          "ref": "secrets.refresh_token"
+        }
       }
     }
   },
@@ -91,7 +116,10 @@
         "storage": "connection.parameters",
         "type": "string",
         "required": true,
-        "enum": ["service", "user"],
+        "enum": [
+          "service",
+          "user"
+        ],
         "default": "service",
         "ui": {
           "label": "Authentication Method",
@@ -154,7 +182,10 @@
     "implementation": {
       "type": "builtin"
     },
-    "produces": ["connection.endpoints", "connection.type_map"],
+    "produces": [
+      "connection.endpoints",
+      "connection.type_map"
+    ],
     "triggers": {
       "list_resources": "on_activation",
       "describe_resource": "on_resource_selected"
