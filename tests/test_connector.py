@@ -184,6 +184,21 @@ class TestRenderColumnType:
         with pytest.raises(ValueError, match="neither NUMERIC"):
             self.dialect.render_column_type("Decimal256(76, 76)", self.mapper)
 
+    def test_scale_over_9_pushes_to_bignumeric(self):
+        # precision 20 <= 38, but scale 12 > NUMERIC's 9 -> BIGNUMERIC.
+        assert (
+            self.dialect.render_column_type("Decimal128(20, 12)", self.mapper)
+            == "BIGNUMERIC(20, 12)"
+        )
+
+    def test_numeric_exact_max_boundary(self):
+        # precision 38, scale 9, integer digits 29 — all three NUMERIC bounds
+        # at their exact maximum.
+        assert (
+            self.dialect.render_column_type("Decimal128(38, 9)", self.mapper)
+            == "NUMERIC(38, 9)"
+        )
+
     @pytest.mark.parametrize("canonical", ["Duration(SECOND)", "Interval(MONTH_DAY_NANO)"])
     def test_duration_interval_rejected(self, canonical):
         with pytest.raises(ValueError, match="no loadable BigQuery"):
@@ -496,6 +511,21 @@ class TestBuildGoogleCredentials:
         with pytest.raises(AdbcConfigurationError, match="unsupported driver auth_type"):
             bq._build_google_credentials("something_else", _opt_from({}))
 
+    def test_service_getoption_raised_points_at_driver_floor(self):
+        # opt returns None (GetOption itself raised) for the credentials key
+        # -> the error must blame the driver install, not the connection.
+        def opt(key):
+            return None if key == bq._OPT_AUTH_CREDENTIALS else ""
+
+        with pytest.raises(AdbcConfigurationError, match="1.11.0"):
+            bq._build_google_credentials("x.json_credential_string", opt)
+
+    def test_user_getoption_raised_points_at_driver_floor(self):
+        with pytest.raises(AdbcConfigurationError, match="1.11.0"):
+            bq._build_google_credentials(
+                "x.user_authentication", lambda key: None
+            )
+
 
 # --------------------------------------------------------------------------
 # Google-error classification
@@ -628,7 +658,7 @@ class TestBulkLand:
         client.close.assert_called_once()
 
     def test_deterministic_google_error_wrapped_fatal(self, monkeypatch):
-        self._patch_client(monkeypatch)
+        client = self._patch_client(monkeypatch)
         monkeypatch.setattr(
             bq,
             "_drain_load_job_chain",
@@ -638,9 +668,10 @@ class TestBulkLand:
         stage = TableAddress(table="_stg", schema="ds", catalog="proj")
         with pytest.raises(AdbcConfigurationError, match="failed deterministically"):
             dialect.bulk_land(object(), stage, self._batch(), runtime=None)
+        client.close.assert_called_once()  # closed even on the error path
 
     def test_retryable_google_error_propagates(self, monkeypatch):
-        self._patch_client(monkeypatch)
+        client = self._patch_client(monkeypatch)
         monkeypatch.setattr(
             bq,
             "_drain_load_job_chain",
@@ -652,3 +683,190 @@ class TestBulkLand:
         stage = TableAddress(table="_stg", schema="ds", catalog="proj")
         with pytest.raises(gexc.InternalServerError):
             dialect.bulk_land(object(), stage, self._batch(), runtime=None)
+        client.close.assert_called_once()
+
+    def test_arrow_memory_error_stays_retryable(self, monkeypatch):
+        # Transient memory pressure must NOT be wrapped fatal — it re-raises
+        # as ArrowMemoryError (RETRYABLE), unlike a deterministic ValueError.
+        client = self._patch_client(monkeypatch)
+
+        def _oom(batch):
+            raise pa.ArrowMemoryError("out of memory")
+
+        monkeypatch.setattr(bq, "_jsonify_nested_columns", _oom)
+        dialect = BigQueryDialect()
+        stage = TableAddress(table="_stg", schema="ds", catalog="proj")
+        with pytest.raises(pa.ArrowMemoryError):
+            dialect.bulk_land(object(), stage, self._batch(), runtime=None)
+        client.close.assert_called_once()
+
+    def test_destination_project_falls_back_to_data_project(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        client = MagicMock(name="bq_client")
+        client.project = "client-proj"
+        monkeypatch.setattr(
+            bq, "_build_bigquery_client", lambda conn: (client, "data-proj")
+        )
+        monkeypatch.setattr(bq, "_resolve_dataset_location", lambda c, d: None)
+        monkeypatch.setattr(
+            bq, "_drain_load_job_chain", lambda c, p, *, location: 0
+        )
+        captured = {}
+        monkeypatch.setattr(
+            bq,
+            "_submit_and_poll",
+            lambda c, buf, dest, *, job_id, location: captured.update(
+                project=dest.project
+            ),
+        )
+        dialect = BigQueryDialect()
+        stage = TableAddress(table="_stg", schema="ds")  # no catalog
+        dialect.bulk_land(object(), stage, self._batch(), runtime=None)
+        # catalog empty -> destination project is the data_project, not the
+        # client's own billing project.
+        assert captured["project"] == "data-proj"
+
+
+# --------------------------------------------------------------------------
+# Client construction from the live ADBC connection
+# --------------------------------------------------------------------------
+
+
+class _FakeAdbcDatabase:
+    """Fake ADBC database handle answering GetOption, raising on `raising`."""
+
+    def __init__(self, options, raising=()):
+        self._options = options
+        self._raising = set(raising)
+
+    def get_option(self, key):
+        if key in self._raising:
+            raise RuntimeError("GetOption unsupported on this driver")
+        return self._options.get(key, "")
+
+
+class _FakeConn:
+    def __init__(self, options, raising=()):
+        self.adbc_database = _FakeAdbcDatabase(options, raising)
+
+
+class TestBuildBigqueryClient:
+    def _service_conn(self, extra, raising=()):
+        opts = {
+            bq._OPT_AUTH_TYPE: "adbc.bigquery.sql.auth_type.json_credential_string",
+            bq._OPT_AUTH_CREDENTIALS: json.dumps(
+                {"type": "service_account", "project_id": "key-proj"}
+            ),
+        }
+        opts.update(extra)
+        return _FakeConn(opts, raising)
+
+    def _patch_creds_and_client(self, monkeypatch, captured):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "google.oauth2.service_account.Credentials.from_service_account_info",
+            lambda info, scopes: MagicMock(name="creds"),
+        )
+
+        def _fake_client(*, project, credentials, location):
+            captured.update(project=project, location=location)
+            return MagicMock(name="client", project=project)
+
+        monkeypatch.setattr("google.cloud.bigquery.Client", _fake_client)
+
+    def test_empty_project_everywhere_is_fatal(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "google.oauth2.service_account.Credentials.from_service_account_info",
+            lambda info, scopes: MagicMock(),
+        )
+        # service key with NO embedded project, and no project_id / quota opt
+        conn = _FakeConn(
+            {
+                bq._OPT_AUTH_TYPE: "x.json_credential_string",
+                bq._OPT_AUTH_CREDENTIALS: json.dumps({"type": "service_account"}),
+            }
+        )
+        with pytest.raises(AdbcConfigurationError, match="need a GCP project"):
+            bq._build_bigquery_client(conn)
+
+    def test_project_precedence_and_billing(self, monkeypatch):
+        captured = {}
+        self._patch_creds_and_client(monkeypatch, captured)
+        conn = self._service_conn(
+            {
+                bq._OPT_PROJECT_ID: "conn-proj",
+                bq._OPT_QUOTA_PROJECT: "billing-proj",
+                bq._OPT_LOCATION: "EU",
+            }
+        )
+        _client, data_project = bq._build_bigquery_client(conn)
+        assert data_project == "conn-proj"  # project_id wins over key project
+        assert captured["project"] == "billing-proj"  # quota_project = billing
+        assert captured["location"] == "EU"
+
+    def test_billing_falls_back_to_data_project(self, monkeypatch):
+        captured = {}
+        self._patch_creds_and_client(monkeypatch, captured)
+        conn = self._service_conn({bq._OPT_PROJECT_ID: "conn-proj"})  # no quota
+        _client, data_project = bq._build_bigquery_client(conn)
+        assert data_project == "conn-proj"
+        assert captured["project"] == "conn-proj"  # billing <- data_project
+        assert captured["location"] is None  # no location opt
+
+    def test_data_project_falls_back_to_key_project(self, monkeypatch):
+        captured = {}
+        self._patch_creds_and_client(monkeypatch, captured)
+        conn = self._service_conn({})  # no project_id opt -> use key's project
+        _client, data_project = bq._build_bigquery_client(conn)
+        assert data_project == "key-proj"
+
+
+class TestStageRowCount:
+    def test_reads_scalar_count(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.query.return_value.result.return_value = [[7]]
+        dest = MagicMock(project="p", dataset_id="d", table_id="t")
+        assert bq._stage_row_count(client, dest, location="US") == 7
+        args, kwargs = client.query.call_args
+        assert "COUNT(*)" in args[0]
+        assert "`p`.`d`.`t`" in args[0]
+        assert kwargs["location"] == "US"
+
+    def test_empty_result_is_zero(self):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.query.return_value.result.return_value = []
+        dest = MagicMock(project="p", dataset_id="d", table_id="t")
+        assert bq._stage_row_count(client, dest, location=None) == 0
+
+
+class TestJobTerminalState:
+    def test_reload_success_reports_committed(self):
+        from unittest.mock import MagicMock
+
+        job = MagicMock(state="DONE", error_result=None)
+        assert bq._job_terminal_state(job) == (True, True)
+
+    def test_reload_raises_falls_back_to_cached_state(self):
+        from unittest.mock import MagicMock
+
+        # A network blip on reload() must NOT hide a locally-DONE failed job
+        # (a burnable terminal failure), so it returns (True, False) — never
+        # the conservative "possibly live" (False, ...).
+        job = MagicMock(state="DONE", error_result={"reason": "invalid"})
+        job.reload.side_effect = RuntimeError("network blip")
+        assert bq._job_terminal_state(job) == (True, False)
+
+    def test_reload_raises_and_not_done_is_still_live(self):
+        from unittest.mock import MagicMock
+
+        job = MagicMock(state="RUNNING", error_result=None)
+        job.reload.side_effect = RuntimeError("network blip")
+        assert bq._job_terminal_state(job) == (False, False)

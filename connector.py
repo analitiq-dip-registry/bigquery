@@ -20,9 +20,10 @@ SELECT`` for append / truncate-insert, or this dialect's
 ``merge_statement_sql`` (GoogleSQL ``MERGE``) for upsert - and finally
 ``DROP`` the stage. The connector declares this shape in
 ``definition/connector.json`` ``sql_capabilities`` (``bulk_load.adbc:
-load_job``, ``stage.scope: real``, ``merge_form: merge``, ``catalog:
-full``); without that block the engine fails every write at
-``configure_schema`` time.
+load_job``, ``stage.scope: real``, ``stage.schema: target``,
+``stage.transactional_ddl: false``, ``merge_form: merge``,
+``session_targeting: per_statement``, ``catalog: full``); without that
+block the engine fails every write at ``configure_schema`` time.
 
 The BigQuery-specific write mechanism lives in ``BigQueryDialect.bulk_land``:
 the ADBC driver implements no ``adbc.ingest.*`` bulk path
@@ -37,15 +38,17 @@ media upload - no GCS staging bucket) into the freshly-created stage table.
   ``bulk_land`` submits its load under a DETERMINISTIC job-id chain
   (``analitiq_<token>_0``, ``_1``, ...) whose token hashes that stage
   identity and the exact Parquet payload. BigQuery load jobs are idempotent
-  by job id, so a client-side polling timeout WITHIN a call re-attaches to
-  the running job instead of re-submitting. ACROSS engine retries (which
-  drop+recreate the stage) the chain walk first drains any prior in-flight
-  job of this batch to a terminal state - closing the window where an
-  abandoned job commits into the recreated same-named stage after a fresh
-  load already filled it - and then, if a drained job already landed this
-  exact payload into the current stage incarnation (row count matches),
-  reuses it rather than double-loading; otherwise it submits a fresh chain
-  id. Row idempotency across attempts otherwise lives in the engine's mode
+  by job id. WITHIN a call, a re-submission that collides with an
+  already-existing id (an ``Already Exists: Job`` conflict - an HTTP-layer
+  insert retry) attaches to that job instead of duplicating it. ACROSS
+  engine retries (which drop+recreate the stage), a prior attempt whose
+  client-side polling was interrupted may have left its job running
+  server-side; the chain walk finds and drains that job to a terminal
+  state - closing the window where an abandoned job commits into the
+  recreated same-named stage after a fresh load already filled it - and
+  then, if the drained job already landed this exact payload into the
+  current stage incarnation (row count matches), reuses it rather than
+  double-loading; otherwise it submits a fresh chain id. Row idempotency across attempts otherwise lives in the engine's mode
   statement (``MERGE`` for upsert; the anti-join ``INSERT ... SELECT`` for
   keyed insert).
 * **Credentials** - recovered per call from the SAME connection state the
@@ -623,8 +626,8 @@ def _build_bigquery_client(conn: Any) -> tuple[bigquery.Client, str]:
 
     Returns ``(client, data_project)``. *data_project* is the
     dataset-owning project (the connection's ``project_id``, else the
-    service-account key's), which may differ from the client's billing
-    project.
+    service-account key's, else the billing project), which may differ
+    from the client's billing project.
     """
     from google.cloud import bigquery
 
@@ -973,10 +976,12 @@ def _is_deterministic_google_error(exc: BaseException) -> bool:
 class BigQueryDialect(SqlDialect):
     """BigQuery SQL strategy: backtick quoting, three-level (project ->
     dataset -> table) addressing, NOT ENFORCED primary keys, dataset-scoped
-    INFORMATION_SCHEMA composition, the ``CREATE TABLE ... LIKE`` stage
-    clone for the MERGE upsert, and load-job-aware type rendering (the
-    NUMERIC/BIGNUMERIC precision-range choice; Duration/Interval
-    rejection)."""
+    INFORMATION_SCHEMA composition, the stage-then-apply write renderings
+    every write mode's cycle uses (``CREATE TABLE ... LIKE`` stage clone,
+    GoogleSQL ``MERGE`` upsert, ``DELETE ... WHERE TRUE`` truncate), the
+    BigQuery load job as the stage-fill mechanism (``bulk_land``), and
+    load-job-aware type rendering (the NUMERIC/BIGNUMERIC precision-range
+    choice; Duration/Interval rejection)."""
 
     name = "bigquery"
     #: BigQuery reads double quotes as string literals; identifiers use backticks.
