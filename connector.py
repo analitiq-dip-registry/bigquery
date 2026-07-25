@@ -838,7 +838,16 @@ def _drain_load_job_chain(
                 # the engine backs off and the next attempt re-attaches.
                 raise
             # Terminal (committed or failed): fall through. bulk_land's
-            # stage row-count guard decides reuse vs. fresh submit.
+            # stage row-count guard decides reuse vs. fresh submit. Log the
+            # prior-attempt failure so a persistently-failing chain is
+            # visible (a failed load commits nothing, so advancing is safe).
+            logger.info(
+                "BigQuery load job %s from a previous attempt reached a "
+                "terminal failure; the stage row-count guard will reuse or "
+                "resubmit (a failed load commits nothing)",
+                last_job.job_id,
+                exc_info=True,
+            )
     return index
 
 
