@@ -159,12 +159,15 @@ _OPT_LOCATION = "adbc.bigquery.sql.location"
 _OPT_QUOTA_PROJECT = "adbc.bigquery.sql.auth.quota_project"
 
 #: HTTP status codes on Google API call errors that CAN heal between
-#: retries. Consulted only after the reason-based classification.
+#: retries. The HTTP status is the authoritative signal (it reflects the
+#: primary error_result); reason codes only rescue the 4xx cases BigQuery
+#: misuses for transient conditions.
 _RETRYABLE_HTTP_CODES = frozenset({408, 429})
 #: Google API error ``reason`` codes that are transient per BigQuery's
 #: error-table guidance (retry with backoff). The throttling pair matters
-#: most: BigQuery maps rateLimitExceeded / quotaExceeded to HTTP 403,
-#: which a bare 4xx rule would misread as a deterministic config defect.
+#: most: BigQuery maps rateLimitExceeded / quotaExceeded to HTTP 403 and
+#: tableUnavailable to HTTP 400, which a bare 4xx rule would misread as a
+#: deterministic config defect.
 _RETRYABLE_GOOGLE_REASONS = frozenset(
     {
         "rateLimitExceeded",
@@ -174,6 +177,21 @@ _RETRYABLE_GOOGLE_REASONS = frozenset(
         # Google's error table says retry-with-backoff for this one too,
         # even though the client library maps it to HTTP 400.
         "tableUnavailable",
+    }
+)
+#: Google API error ``reason`` codes that cannot heal between retries. Used
+#: to break ties in a mixed error stream: a load job that fails on bad data
+#: (``invalid``) but whose error list ALSO carries a transient secondary
+#: reason (``backendError``) must stay deterministic, not be flipped
+#: retryable by the secondary reason (which would retry unloadable data to
+#: the engine's cap on every attempt).
+_DETERMINISTIC_GOOGLE_REASONS = frozenset(
+    {
+        "accessDenied",
+        "invalid",
+        "invalidQuery",
+        "notFound",
+        "duplicate",
     }
 )
 #: RFC 6749 token-endpoint error codes that cannot heal between retries
@@ -917,24 +935,24 @@ def _google_error_reasons(exc: BaseException) -> frozenset[str]:
 def _is_deterministic_refresh_error(exc: BaseException) -> bool:
     """True when a RefreshError names a deterministic OAuth error.
 
-    google-auth marks transient refresh failures (token-endpoint 5xx,
-    ``server_error`` / ``temporarily_unavailable``) with
-    ``retryable=True`` - honor that first. Otherwise look for a
-    deterministic RFC 6749 error code in the response payload (a
-    Mapping in ``args``) or the message text. A refresh failure with
-    no recognizable code stays retryable: a few wasted retries on a
-    dead credential cost far less than fatally failing a healthy
-    stream on a transient wobble.
+    A deterministic RFC 6749 code (``invalid_grant`` on a
+    revoked/expired refresh token, ``invalid_client`` on rotated client
+    credentials) cannot heal between retries, so it WINS over google-auth's
+    transient ``retryable`` flag: the transport layer can tag a refresh
+    retryable even when its OAuth body is a permanent grant failure, and
+    honoring the flag first would retry a dead credential to the engine's
+    cap on every batch under auth_type=user. The deterministic code is
+    read from the structured response payload (a Mapping in ``args``)
+    first, then the message text. A refresh failure with no recognizable
+    code stays retryable: a few wasted retries on a dead credential cost
+    far less than fatally failing a healthy stream on a transient wobble.
     """
-    if getattr(exc, "retryable", False):
-        return False
     for arg in exc.args:
         if isinstance(arg, Mapping):
             code = str(arg.get("error") or "")
             if code:
                 return code in _DETERMINISTIC_OAUTH_ERRORS
-    text = str(exc)
-    return any(code in text for code in _DETERMINISTIC_OAUTH_ERRORS)
+    return any(code in str(exc) for code in _DETERMINISTIC_OAUTH_ERRORS)
 
 
 def _is_deterministic_google_error(exc: BaseException) -> bool:
@@ -953,13 +971,15 @@ def _is_deterministic_google_error(exc: BaseException) -> bool:
       rebuilt (and refreshes) on every call.
     * Other ``GoogleAuthError`` (malformed / missing credential
       material) - deterministic.
-    * ``GoogleAPICallError`` - classified by error *reason* first:
-      BigQuery maps throttling (rateLimitExceeded / quotaExceeded) to
-      HTTP 403, which a bare 4xx rule would misread as a config
-      defect; Google's guidance for those is retry with backoff.
-      Unambiguously deterministic reasons (accessDenied, invalid,
-      notFound, duplicate) carry non-408/429 4xx codes and fall
-      through to the status rule. 5xx stays retryable.
+    * ``GoogleAPICallError`` - the HTTP status is authoritative (it
+      reflects the primary ``error_result``): 5xx and 408/429 are
+      transient. A 4xx is deterministic UNLESS a reason BigQuery misuses
+      for a transient condition is present (throttling on 403; ``
+      tableUnavailable`` on 400) - and even then a co-occurring
+      unambiguously deterministic reason wins, so a data error whose
+      error stream also carries a transient secondary reason is not
+      flipped retryable. A reason-less 403 leans retryable (most often an
+      unparsed throttle envelope, not a mid-stream permission loss).
     """
     from google.api_core import exceptions as api_exceptions
     from google.auth import exceptions as auth_exceptions
@@ -971,14 +991,29 @@ def _is_deterministic_google_error(exc: BaseException) -> bool:
     if isinstance(exc, auth_exceptions.GoogleAuthError):
         return True
     if isinstance(exc, api_exceptions.GoogleAPICallError):
-        if _google_error_reasons(exc) & _RETRYABLE_GOOGLE_REASONS:
-            return False
         code = getattr(exc, "code", None)
-        return (
-            isinstance(code, int)
-            and 400 <= code < 500
-            and code not in _RETRYABLE_HTTP_CODES
-        )
+        reasons = _google_error_reasons(exc)
+        # Transient by HTTP status: 5xx (backendError / internalError) and
+        # 408 / 429.
+        if isinstance(code, int) and (
+            code >= 500 or code in _RETRYABLE_HTTP_CODES
+        ):
+            return False
+        # Rescue the transient conditions BigQuery maps onto 4xx (throttling
+        # on 403; tableUnavailable on 400), but let a co-occurring
+        # deterministic reason win so a mixed error stream on a data defect
+        # is not flipped retryable and retried to the engine's cap.
+        if (reasons & _RETRYABLE_GOOGLE_REASONS) and not (
+            reasons & _DETERMINISTIC_GOOGLE_REASONS
+        ):
+            return False
+        # A reason-less 403 is most often an unparsed throttle envelope;
+        # lean retryable rather than fatally killing a healthy stream.
+        if code == 403 and not reasons:
+            return False
+        # Any other 4xx is deterministic; an absent/unknown status code
+        # stays retryable (we cannot confirm the failure cannot heal).
+        return isinstance(code, int) and 400 <= code < 500
     return False
 
 

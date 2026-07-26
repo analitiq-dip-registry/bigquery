@@ -559,6 +559,47 @@ class TestErrorClassification:
     def test_server_error_5xx_is_retryable(self):
         assert bq._is_deterministic_google_error(gexc.InternalServerError("boom")) is False
 
+    # ---- H1: a deterministic error with a transient secondary reason ----
+
+    def test_deterministic_reason_wins_over_secondary_transient_reason(self):
+        # 400 invalid (deterministic) whose error stream ALSO carries a
+        # transient backendError must stay FATAL, not be flipped retryable.
+        exc = gexc.BadRequest(
+            "bad data",
+            errors=[{"reason": "invalid"}, {"reason": "backendError"}],
+        )
+        assert bq._is_deterministic_google_error(exc) is True
+
+    def test_access_denied_403_with_reason_stays_deterministic(self):
+        exc = gexc.Forbidden("denied", errors=[{"reason": "accessDenied"}])
+        assert bq._is_deterministic_google_error(exc) is True
+
+    def test_table_unavailable_400_is_retryable(self):
+        exc = gexc.BadRequest("busy", errors=[{"reason": "tableUnavailable"}])
+        assert bq._is_deterministic_google_error(exc) is False
+
+    # ---- M1: a reason-less 403 leans retryable ----
+
+    def test_reasonless_403_is_retryable(self):
+        # No parseable reason -> most likely an unparsed throttle envelope;
+        # must not fatally kill a healthy stream.
+        assert bq._is_deterministic_google_error(gexc.Forbidden("no reason")) is False
+
+    def test_reasonless_400_stays_deterministic(self):
+        assert bq._is_deterministic_google_error(gexc.BadRequest("no reason")) is True
+
+    # ---- H2: a deterministic OAuth code wins over the retryable flag ----
+
+    def test_refresh_deterministic_code_wins_over_retryable_flag(self):
+        exc = authexc.RefreshError(
+            {"error": "invalid_grant"}, "token revoked", retryable=True
+        )
+        assert bq._is_deterministic_google_error(exc) is True
+
+    def test_refresh_retryable_flag_without_code_stays_retryable(self):
+        exc = authexc.RefreshError("temporary blip", retryable=True)
+        assert bq._is_deterministic_google_error(exc) is False
+
 
 # --------------------------------------------------------------------------
 # bulk_land orchestration (helpers monkeypatched for isolation)
