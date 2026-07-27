@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.0] - 2026-07-27
+
+### Added
+- feat: rewrite write path onto rc17 stage-then-apply dialect hooks (#11)
+
 ## [1.1.0] - 2026-07-23
 
 ### Added
