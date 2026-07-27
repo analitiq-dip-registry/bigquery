@@ -190,5 +190,18 @@
       "list_resources": "on_activation",
       "describe_resource": "on_resource_selected"
     }
+  },
+  "sql_capabilities": {
+    "catalog": "full",
+    "session_targeting": "per_statement",
+    "merge_form": "merge",
+    "bulk_load": {
+      "adbc": "load_job"
+    },
+    "stage": {
+      "scope": "real",
+      "schema": "target",
+      "transactional_ddl": false
+    }
   }
 }

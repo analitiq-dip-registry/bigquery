@@ -14,6 +14,13 @@ dynamic = ["dependencies"]
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
+# Test-only deps. pyarrow is normally CDK-provided (see requirements.txt) but
+# is listed here so the suite runs standalone (`pip install -e .[test]`); the
+# google-cloud-bigquery / google-auth stack the write-path tests exercise is
+# already a runtime dependency in requirements.txt.
+[project.optional-dependencies]
+test = ["pytest>=7", "pyarrow>=14"]
+
 # The repo root IS the package: connector.py + __init__.py at the top level,
 # per the documented connector layout.
 [tool.setuptools]
