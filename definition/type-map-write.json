@@ -1,29 +1,141 @@
-[
-  {"match": "exact", "canonical": "Boolean", "native": "BOOL"},
-  {"match": "exact", "canonical": "Int8", "native": "INT64"},
-  {"match": "exact", "canonical": "Int16", "native": "INT64"},
-  {"match": "exact", "canonical": "Int32", "native": "INT64"},
-  {"match": "exact", "canonical": "Int64", "native": "INT64"},
-  {"match": "exact", "canonical": "UInt8", "native": "INT64"},
-  {"match": "exact", "canonical": "UInt16", "native": "INT64"},
-  {"match": "exact", "canonical": "UInt32", "native": "INT64"},
-  {"match": "exact", "canonical": "UInt64", "native": "INT64"},
-  {"match": "exact", "canonical": "Float16", "native": "FLOAT64"},
-  {"match": "exact", "canonical": "Float32", "native": "FLOAT64"},
-  {"match": "exact", "canonical": "Float64", "native": "FLOAT64"},
-  {"match": "exact", "canonical": "Utf8", "native": "STRING"},
-  {"match": "exact", "canonical": "LargeUtf8", "native": "STRING"},
-  {"match": "exact", "canonical": "Binary", "native": "BYTES"},
-  {"match": "exact", "canonical": "LargeBinary", "native": "BYTES"},
-  {"match": "exact", "canonical": "Date32", "native": "DATE"},
-  {"match": "exact", "canonical": "Date64", "native": "DATE"},
-  {"match": "exact", "canonical": "Json", "native": "STRING"},
-  {"match": "exact", "canonical": "Object", "native": "STRING"},
-  {"match": "regex", "canonical": "^FixedSizeBinary\\(\\d+\\)$", "native": "BYTES"},
-  {"match": "regex", "canonical": "^Time(32|64)\\(.*\\)$", "native": "TIME"},
-  {"match": "regex", "canonical": "^Timestamp\\([^,)]+,[^)]+\\)$", "native": "TIMESTAMP"},
-  {"match": "regex", "canonical": "^Timestamp\\([^,)]+\\)$", "native": "DATETIME"},
-  {"match": "regex", "canonical": "^(List|LargeList|FixedSizeList)<.*>$", "native": "STRING"},
-  {"match": "regex", "canonical": "^Struct<.*>$", "native": "STRING"},
-  {"match": "regex", "canonical": "^Map<.*>$", "native": "STRING"}
-]
+{
+  "$schema": "https://schemas.analitiq.ai/type-map-write/latest.json",
+  "direction": "write",
+  "rules": [
+    {
+      "match": "exact",
+      "native_type": "BOOL",
+      "arrow_type": "Boolean"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "Int8"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "Int16"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "Int32"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "UInt8"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "UInt16"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "UInt32"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "UInt64"
+    },
+    {
+      "match": "exact",
+      "native_type": "FLOAT64",
+      "arrow_type": "Float16"
+    },
+    {
+      "match": "exact",
+      "native_type": "FLOAT64",
+      "arrow_type": "Float32"
+    },
+    {
+      "match": "exact",
+      "native_type": "FLOAT64",
+      "arrow_type": "Float64"
+    },
+    {
+      "match": "exact",
+      "native_type": "STRING",
+      "arrow_type": "Utf8"
+    },
+    {
+      "match": "exact",
+      "native_type": "STRING",
+      "arrow_type": "LargeUtf8"
+    },
+    {
+      "match": "exact",
+      "native_type": "BYTES",
+      "arrow_type": "Binary"
+    },
+    {
+      "match": "exact",
+      "native_type": "BYTES",
+      "arrow_type": "LargeBinary"
+    },
+    {
+      "match": "exact",
+      "native_type": "DATE",
+      "arrow_type": "Date32"
+    },
+    {
+      "match": "exact",
+      "native_type": "DATE",
+      "arrow_type": "Date64"
+    },
+    {
+      "match": "exact",
+      "native_type": "STRING",
+      "arrow_type": "Json"
+    },
+    {
+      "match": "exact",
+      "native_type": "STRING",
+      "arrow_type": "Object"
+    },
+    {
+      "match": "regex",
+      "native_type": "BYTES",
+      "arrow_type": "^FixedSizeBinary\\(\\d+\\)$"
+    },
+    {
+      "match": "regex",
+      "native_type": "TIME",
+      "arrow_type": "^Time(32|64)\\(.*\\)$"
+    },
+    {
+      "match": "regex",
+      "native_type": "TIMESTAMP",
+      "arrow_type": "^Timestamp\\([^,)]+,[^)]+\\)$"
+    },
+    {
+      "match": "regex",
+      "native_type": "DATETIME",
+      "arrow_type": "^Timestamp\\([^,)]+\\)$"
+    },
+    {
+      "match": "regex",
+      "native_type": "STRING",
+      "arrow_type": "^(List|LargeList|FixedSizeList)<.*>$"
+    },
+    {
+      "match": "regex",
+      "native_type": "STRING",
+      "arrow_type": "^Struct<.*>$"
+    },
+    {
+      "match": "regex",
+      "native_type": "STRING",
+      "arrow_type": "^Map<.*>$"
+    }
+  ]
+}
