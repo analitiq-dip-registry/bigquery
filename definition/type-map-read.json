@@ -1,39 +1,191 @@
-[
-  {"match": "exact", "native": "INT64", "canonical": "Int64"},
-  {"match": "exact", "native": "INT", "canonical": "Int64"},
-  {"match": "exact", "native": "SMALLINT", "canonical": "Int64"},
-  {"match": "exact", "native": "INTEGER", "canonical": "Int64"},
-  {"match": "exact", "native": "BIGINT", "canonical": "Int64"},
-  {"match": "exact", "native": "TINYINT", "canonical": "Int64"},
-  {"match": "exact", "native": "BYTEINT", "canonical": "Int64"},
-  {"match": "exact", "native": "FLOAT64", "canonical": "Float64"},
-  {"match": "exact", "native": "FLOAT", "canonical": "Float64"},
-  {"match": "exact", "native": "BOOL", "canonical": "Boolean"},
-  {"match": "exact", "native": "BOOLEAN", "canonical": "Boolean"},
-  {"match": "exact", "native": "STRING", "canonical": "Utf8"},
-  {"match": "exact", "native": "BYTES", "canonical": "Binary"},
-  {"match": "exact", "native": "DATE", "canonical": "Date32"},
-  {"match": "exact", "native": "DATETIME", "canonical": "Timestamp(MICROSECOND)"},
-  {"match": "exact", "native": "TIME", "canonical": "Time64(MICROSECOND)"},
-  {"match": "exact", "native": "TIMESTAMP", "canonical": "Timestamp(MICROSECOND, UTC)"},
-  {"match": "exact", "native": "NUMERIC", "canonical": "Decimal128(38, 9)"},
-  {"match": "exact", "native": "DECIMAL", "canonical": "Decimal128(38, 9)"},
-  {"match": "exact", "native": "BIGNUMERIC", "canonical": "Decimal256(76, 38)"},
-  {"match": "exact", "native": "BIGDECIMAL", "canonical": "Decimal256(76, 38)"},
-  {"match": "exact", "native": "GEOGRAPHY", "canonical": "Utf8"},
-  {"match": "exact", "native": "JSON", "canonical": "Json"},
-  {"match": "exact", "native": "INTERVAL", "canonical": "Utf8"},
-  {"match": "regex", "native": "^NUMERIC\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$", "canonical": "Decimal128(${p}, ${s})"},
-  {"match": "regex", "native": "^DECIMAL\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$", "canonical": "Decimal128(${p}, ${s})"},
-  {"match": "regex", "native": "^BIGNUMERIC\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$", "canonical": "Decimal256(${p}, ${s})"},
-  {"match": "regex", "native": "^BIGDECIMAL\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$", "canonical": "Decimal256(${p}, ${s})"},
-  {"match": "regex", "native": "^NUMERIC\\(\\s*(?<p>\\d+)\\s*\\)$", "canonical": "Decimal128(${p}, 0)"},
-  {"match": "regex", "native": "^DECIMAL\\(\\s*(?<p>\\d+)\\s*\\)$", "canonical": "Decimal128(${p}, 0)"},
-  {"match": "regex", "native": "^BIGNUMERIC\\(\\s*(?<p>\\d+)\\s*\\)$", "canonical": "Decimal256(${p}, 0)"},
-  {"match": "regex", "native": "^BIGDECIMAL\\(\\s*(?<p>\\d+)\\s*\\)$", "canonical": "Decimal256(${p}, 0)"},
-  {"match": "regex", "native": "^STRING\\(\\s*\\d+\\s*\\)$", "canonical": "Utf8"},
-  {"match": "regex", "native": "^BYTES\\(\\s*\\d+\\s*\\)$", "canonical": "Binary"},
-  {"match": "regex", "native": "^ARRAY<.*>$", "canonical": "Json"},
-  {"match": "regex", "native": "^STRUCT<.*>$", "canonical": "Json"},
-  {"match": "regex", "native": "^RANGE<.*>$", "canonical": "Json"}
-]
+{
+  "$schema": "https://schemas.analitiq.ai/type-map-read/latest.json",
+  "direction": "read",
+  "rules": [
+    {
+      "match": "exact",
+      "native_type": "INT64",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "INT",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "SMALLINT",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "INTEGER",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "BIGINT",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "TINYINT",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "BYTEINT",
+      "arrow_type": "Int64"
+    },
+    {
+      "match": "exact",
+      "native_type": "FLOAT64",
+      "arrow_type": "Float64"
+    },
+    {
+      "match": "exact",
+      "native_type": "FLOAT",
+      "arrow_type": "Float64"
+    },
+    {
+      "match": "exact",
+      "native_type": "BOOL",
+      "arrow_type": "Boolean"
+    },
+    {
+      "match": "exact",
+      "native_type": "BOOLEAN",
+      "arrow_type": "Boolean"
+    },
+    {
+      "match": "exact",
+      "native_type": "STRING",
+      "arrow_type": "Utf8"
+    },
+    {
+      "match": "exact",
+      "native_type": "BYTES",
+      "arrow_type": "Binary"
+    },
+    {
+      "match": "exact",
+      "native_type": "DATE",
+      "arrow_type": "Date32"
+    },
+    {
+      "match": "exact",
+      "native_type": "DATETIME",
+      "arrow_type": "Timestamp(MICROSECOND)"
+    },
+    {
+      "match": "exact",
+      "native_type": "TIME",
+      "arrow_type": "Time64(MICROSECOND)"
+    },
+    {
+      "match": "exact",
+      "native_type": "TIMESTAMP",
+      "arrow_type": "Timestamp(MICROSECOND, UTC)"
+    },
+    {
+      "match": "exact",
+      "native_type": "NUMERIC",
+      "arrow_type": "Decimal128(38, 9)"
+    },
+    {
+      "match": "exact",
+      "native_type": "DECIMAL",
+      "arrow_type": "Decimal128(38, 9)"
+    },
+    {
+      "match": "exact",
+      "native_type": "BIGNUMERIC",
+      "arrow_type": "Decimal256(76, 38)"
+    },
+    {
+      "match": "exact",
+      "native_type": "BIGDECIMAL",
+      "arrow_type": "Decimal256(76, 38)"
+    },
+    {
+      "match": "exact",
+      "native_type": "GEOGRAPHY",
+      "arrow_type": "Utf8"
+    },
+    {
+      "match": "exact",
+      "native_type": "JSON",
+      "arrow_type": "Json"
+    },
+    {
+      "match": "exact",
+      "native_type": "INTERVAL",
+      "arrow_type": "Utf8"
+    },
+    {
+      "match": "regex",
+      "native_type": "^NUMERIC\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal128(${p}, ${s})"
+    },
+    {
+      "match": "regex",
+      "native_type": "^DECIMAL\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal128(${p}, ${s})"
+    },
+    {
+      "match": "regex",
+      "native_type": "^BIGNUMERIC\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal256(${p}, ${s})"
+    },
+    {
+      "match": "regex",
+      "native_type": "^BIGDECIMAL\\(\\s*(?<p>\\d+)\\s*,\\s*(?<s>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal256(${p}, ${s})"
+    },
+    {
+      "match": "regex",
+      "native_type": "^NUMERIC\\(\\s*(?<p>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal128(${p}, 0)"
+    },
+    {
+      "match": "regex",
+      "native_type": "^DECIMAL\\(\\s*(?<p>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal128(${p}, 0)"
+    },
+    {
+      "match": "regex",
+      "native_type": "^BIGNUMERIC\\(\\s*(?<p>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal256(${p}, 0)"
+    },
+    {
+      "match": "regex",
+      "native_type": "^BIGDECIMAL\\(\\s*(?<p>\\d+)\\s*\\)$",
+      "arrow_type": "Decimal256(${p}, 0)"
+    },
+    {
+      "match": "regex",
+      "native_type": "^STRING\\(\\s*\\d+\\s*\\)$",
+      "arrow_type": "Utf8"
+    },
+    {
+      "match": "regex",
+      "native_type": "^BYTES\\(\\s*\\d+\\s*\\)$",
+      "arrow_type": "Binary"
+    },
+    {
+      "match": "regex",
+      "native_type": "^ARRAY<.*>$",
+      "arrow_type": "Json"
+    },
+    {
+      "match": "regex",
+      "native_type": "^STRUCT<.*>$",
+      "arrow_type": "Json"
+    },
+    {
+      "match": "regex",
+      "native_type": "^RANGE<.*>$",
+      "arrow_type": "Json"
+    }
+  ]
+}
