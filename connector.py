@@ -89,7 +89,7 @@ Everything else BigQuery-specific lives here:
   catalog alone) and region-scoped through the query job's location - set
   the ``location`` connection parameter for non-US datasets.
 * **NUMERIC/BIGNUMERIC render arithmetic** - write-direction logic
-  ``type-map-write.json`` cannot express. NUMERIC (precision <= 38, scale
+  the ``write`` rules of ``type-map.json`` cannot express. NUMERIC (precision <= 38, scale
   <= 9, integer digits ``precision - scale`` <= 29) vs BIGNUMERIC
   (precision <= 76, scale <= 38, integer digits ``precision - scale`` <=
   38) is chosen from BOTH a Decimal's precision and scale, so a plain regex
@@ -1047,7 +1047,7 @@ class BigQueryDialect(SqlDialect):
     #: Canonical families with no loadable BigQuery representation on the
     #: Parquet load-job write path. ``render_column_type`` rejects them at
     #: CREATE TABLE time; they are deliberately absent from
-    #: type-map-write.json (a takeover, not a coverage gap).
+    #: the ``write`` rules of type-map.json (a takeover, not a coverage gap).
     _UNLOADABLE_TEMPORAL_RE = re.compile(r"^(?P<family>Duration|Interval)\b")
 
     # ---- discovery: dataset-scoped INFORMATION_SCHEMA ----------------------
@@ -1340,7 +1340,7 @@ class BigQueryDialect(SqlDialect):
         The canonical is normalized first (``normalize_canonical_type``)
         so every spelling the base mapper would accept takes these same
         paths instead of bypassing them. Every other canonical delegates
-        to ``type-map-write.json`` through the base implementation.
+        to the ``write`` rules of ``type-map.json`` through the base implementation.
         """
         normalized = normalize_canonical_type(canonical)
         unloadable = self._UNLOADABLE_TEMPORAL_RE.match(normalized)

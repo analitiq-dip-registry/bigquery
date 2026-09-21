@@ -66,7 +66,7 @@ This is a database connector — it does not ship a fixed list of endpoints. Ins
 
 | Resource | How it's discovered | Description |
 |----------|---------------------|-------------|
-| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via `definition/type-map-read.json` (write direction: `definition/type-map-write.json`). |
+| Datasets / tables / views | `INFORMATION_SCHEMA` (builtin discovery) | Tables and views in the project (optionally scoped to a default dataset) are listed on activation; column types are mapped to canonical Analitiq types via the `read` section of `definition/type-map.json` (write direction: its `write` section). |
 
 ## Limitations
 
