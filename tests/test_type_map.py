@@ -1,77 +1,20 @@
-"""Pins ``definition/type-map.json``: decimal read bounds and the write section.
+"""Pins the write section of ``definition/type-map.json``: rule order and the
+canonicals deliberately kept out of it.
 
-The type-map contract matches regex rules in RE2 with a full match, on the
-probed native type after ``normalize_native`` (strip, collapse whitespace,
-uppercase). Python ``re`` stands in for RE2 here: the read patterns use only
-literals, ``\\s``, ``\\d``, character classes, alternation, groups and anchors,
-which mean the same in both dialects. The one syntactic difference is the named
-group spelling, RE2 accepts ``(?<p>...)`` and Python needs ``(?P<p>...)``, so it
-is translated before compiling. ``fullmatch`` mirrors the contract's whole-string
-match.
+Read-map regex correctness (e.g. decimal precision/scale bounds) is not
+duplicated here: ``analitiq-validate`` (RULE-TMAP-010) is the single gate over
+a capture's range against its Arrow parameter position, run on every PR by the
+org's pinned validator. A repo-local test re-declaring that check is a second
+gate over the same shape (schema-contracts.md, "One gate per document").
 """
 
 import json
 import re
 from pathlib import Path
 
-import pytest
-
 TYPE_MAP_PATH = Path(__file__).resolve().parent.parent / "definition" / "type-map.json"
 
 TYPE_MAP = json.loads(TYPE_MAP_PATH.read_text(encoding="utf-8"))
-
-
-def _normalize_native(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip()).upper()
-
-
-def _read_arrow_type(native: str):
-    """First-match-wins read lookup; None when no rule matches."""
-    subject = _normalize_native(native)
-    for rule in TYPE_MAP["read"]:
-        if rule["match"] == "exact":
-            if _normalize_native(rule["native_type"]) == subject:
-                return rule["arrow_type"]
-            continue
-        pattern = rule["native_type"].replace("(?<", "(?P<")
-        match = re.fullmatch(pattern, subject)
-        if match:
-            return re.sub(r"\$\{(\w+)\}", lambda m: match.group(m.group(1)), rule["arrow_type"])
-    return None
-
-
-class TestDecimalReadBounds:
-    @pytest.mark.parametrize(
-        "native, arrow",
-        [
-            ("NUMERIC(38,9)", "Decimal128(38, 9)"),
-            ("NUMERIC(1,0)", "Decimal128(1, 0)"),
-            ("NUMERIC( 10 , 2 )", "Decimal128(10, 2)"),
-            ("NUMERIC(10)", "Decimal128(10, 0)"),
-            ("DECIMAL(38,38)", "Decimal128(38, 38)"),
-            ("BIGNUMERIC(76,38)", "Decimal256(76, 38)"),
-            ("BIGNUMERIC(76,76)", "Decimal256(76, 76)"),
-            ("BIGDECIMAL(76)", "Decimal256(76, 0)"),
-        ],
-    )
-    def test_in_range_declarations_map(self, native, arrow):
-        assert _read_arrow_type(native) == arrow
-
-    @pytest.mark.parametrize(
-        "native",
-        [
-            "NUMERIC(39,0)",
-            "NUMERIC(0,0)",
-            "NUMERIC(10,39)",
-            "NUMERIC(39)",
-            "DECIMAL(0)",
-            "BIGNUMERIC(77,0)",
-            "BIGNUMERIC(10,77)",
-            "BIGDECIMAL(77)",
-        ],
-    )
-    def test_out_of_range_declarations_match_no_rule(self, native):
-        assert _read_arrow_type(native) is None
 
 
 class TestWriteSection:
